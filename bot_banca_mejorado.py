@@ -452,14 +452,51 @@ class BotBanca:
         self.client.add_event_handler(self.mensaje_entrante, events.NewMessage(incoming=True))
         self.client.add_event_handler(self.comando_grupo_ventas, events.NewMessage())
 
-    async def avisar(self, mensaje):
-        """Avisa al propietario en Mensajes guardados sin interrumpir el bot."""
-        logger.info("AVISO ADMIN: %s", str(mensaje).replace("\n", " | "))
-        try:
-            return await self.client.send_message("me", str(mensaje), link_preview=False)
-        except Exception as exc:
-            logger.warning("No se pudo enviar el aviso administrativo: %s", exc)
-            return None
+    async def avisar(self, mensaje, *, tema="historial"):
+        """Registra avisos exclusivamente en el grupo de ventas (nunca en 'me').
+
+        La cola se guarda en disco, por lo que un grupo caído no bloquea la API.
+        """
+        texto = str(mensaje)
+        logger.info("AVISO GRUPO [%s]: %s", tema, texto.replace("\n", " | "))
+        if tema == "historial" and any(x in texto.lower() for x in (
+            "activ", "licencia", "desbloque", "se agregaron", "no se sumaron")):
+            tema = "activaciones"
+        if tema not in TEMAS_VENTAS:
+            tema = "historial"
+        self.ventas["salida"].append({"tema": tema, "mensaje": texto})
+        self.guardar_ventas()
+        return None
+
+    def registrar_resultado_activacion(self, uid, estado, *, dias=0, detalle=""):
+        """Conserva un historial de licencia separado del producto de compra.
+
+        Un pedido marcado como VOUCHERS no debe impedir activar una licencia
+        ni convertirse de manera ficticia en una venta de BOT DE BANCA.
+        """
+        producto = self.estado_cliente(uid).get("producto") or "sin pedido"
+        registro = {
+            "fecha": ahora_iso(), "cliente_id": str(uid), "estado": estado,
+            "dias": dias, "producto_solicitado": producto, "detalle": detalle[:500],
+        }
+        self.ventas.setdefault("activaciones", []).append(registro)
+        etiqueta = {
+            "confirmada": "✅ LICENCIA ACTIVADA — API CONFIRMÓ",
+            "no_registrado": "❌ LICENCIA NO ACTIVADA — SIN REGISTRO",
+            "rechazada": "❌ LICENCIA NO ACTIVADA — API RECHAZÓ",
+            "incierta": "⚠️ ACTIVACIÓN SIN CONFIRMAR",
+            "simulacion": "🧪 SIMULACIÓN — NO MODIFICA LA API",
+        }.get(estado, estado.upper())
+        aviso = (f"{etiqueta}\n"
+                 f"🆔 Telegram: {uid}\n"
+                 f"📅 Días confirmados: {dias}\n"
+                 f"📦 Pedido anterior: {producto}\n"
+                 f"🕒 {registro['fecha']}\n"
+                 f"📝 {detalle or 'Sin observaciones'}")
+        self.ventas["salida"].append({"tema": "activaciones", "mensaje": aviso})
+        self.ventas["salida"].append({"tema": "historial", "mensaje": aviso})
+        self.guardar_ventas()
+        return registro
 
     def datos_chat(self, uid):
         dato = self.control.get(str(uid), {})
@@ -627,16 +664,28 @@ class BotBanca:
             logger.warning("Registro de ventas sin grupo: configura grupo_ventas_id")
             return
         if not getattr(self.grupo_ventas, "forum", False):
-            raise RuntimeError("El grupo indicado no tiene los TEMAS activados. Activa Temas desde la configuración del grupo en Telegram; tu cuenta debe tener permisos para administrar temas.")
+            logger.warning("El grupo no usa Temas; los eventos irán al chat principal")
+            self.temas_ids.clear()
+            return
         # Evita recrear temas existentes al reiniciar o si Telegram tarda en indexarlos.
-        encontrados = await self.listar_temas()
+        try:
+            encontrados = await self.listar_temas()
+        except Exception as exc:
+            logger.warning("No se pudieron leer temas (%s); se usará el grupo principal", exc)
+            self.temas_ids.clear()
+            return
         self.temas_ids.clear()
         for clave, titulo in TEMAS_VENTAS.items():
             tema = encontrados.get(titulo)
             if tema is None:
                 parametros = {"peer" if TEMAS_EN_MESSAGES else "channel": self.grupo_ventas,
                               "title": titulo}
-                resultado_creacion = await self.client(CrearTemaRequest(**parametros))
+                try:
+                    resultado_creacion = await self.client(CrearTemaRequest(**parametros))
+                except Exception as exc:
+                    logger.warning("No se pudo crear tema %s: %s. Se usará grupo principal", titulo, exc)
+                    self.temas_ids.clear()
+                    return
                 # Telegram incluye el ID del mensaje de servicio que crea el tema.
                 tema = self.id_tema_creado(resultado_creacion)
                 if tema is None:
@@ -647,8 +696,8 @@ class BotBanca:
                         if tema is not None:
                             break
                 if tema is None:
-                    logger.error("El tema %s pudo crearse, pero Telegram no devolvió el ID. "
-                                 "Se reintentará sin crear duplicados en la siguiente revisión.", titulo)
+                    logger.warning("El tema %s no devolvió ID. Se usará el grupo principal", titulo)
+                    self.temas_ids.clear()
                     return
                 encontrados[titulo] = int(tema)
             self.temas_ids[clave] = int(tema)
@@ -701,18 +750,18 @@ class BotBanca:
         return (await self.listar_temas()).get(nombre)
 
     async def drenar_notificaciones(self):
-        if not self.grupo_ventas or len(self.temas_ids) != len(TEMAS_VENTAS):
+        if not self.grupo_ventas:
             return
         async with self.notificaciones_lock:
             for _ in range(min(50, len(self.ventas["salida"]))):
                 aviso = self.ventas["salida"][0]
-                tema = self.temas_ids.get(aviso["tema"])
-                if tema is None:
-                    return
+                tema = self.temas_ids.get(aviso.get("tema"))
                 try:
+                    parametros = {"link_preview": False, "parse_mode": None}
+                    if tema is not None:
+                        parametros["reply_to"] = tema
                     await self.client.send_message(
-                        self.grupo_ventas, aviso["mensaje"], reply_to=tema,
-                        link_preview=False, parse_mode=None,
+                        self.grupo_ventas, aviso["mensaje"], **parametros,
                     )
                 except FloodWaitError:
                     raise
@@ -738,7 +787,7 @@ class BotBanca:
 
     async def drenar_comprobantes(self):
         tema = self.temas_ids.get("pagos")
-        if not self.grupo_ventas or not tema:
+        if not self.grupo_ventas:
             return
         async with self.notificaciones_lock:
             cola = self.ventas["comprobantes_pendientes"]
@@ -770,9 +819,11 @@ class BotBanca:
                         f"Confirma el pago en este grupo: /pagado {item['pedido']}\n"
                         f"Al entregar el producto: /entregado {item['pedido']}"
                     )
+                    kwargs = {"caption": caption, "parse_mode": None}
+                    if tema is not None:
+                        kwargs["reply_to"] = tema
                     await self.client.send_file(
-                        self.grupo_ventas, mensaje.media, caption=caption,
-                        reply_to=tema, parse_mode=None,
+                        self.grupo_ventas, mensaje.media, **kwargs,
                     )
                 except FloodWaitError:
                     raise
@@ -783,7 +834,7 @@ class BotBanca:
                 self.guardar_ventas()
 
     async def conectar_registro_ventas(self):
-        if self.grupo_ventas is None or len(self.temas_ids) != len(TEMAS_VENTAS):
+        if self.grupo_ventas is None:
             await self.crear_o_abrir_grupo_ventas()
         await self.drenar_notificaciones()
         await self.drenar_comprobantes()
@@ -822,6 +873,16 @@ class BotBanca:
         if event.chat_id != self.grupo_ventas_id or event.sender_id != self.mi_id:
             return
         texto = (event.raw_text or "").strip()
+        if texto.lower() in ("/prueba", "/pruebagrupo"):
+            # Prueba inofensiva del canal de auditoría; NO toca la API ni clientes.
+            self.registrar_resultado_activacion(
+                self.mi_id, "simulacion",
+                detalle="EJEMPLO: activar +30 días -> ACTIVA; retirar 30 -> INACTIVA. "
+                        "Solo simulación; no se cambió la base de datos de licencias.")
+            await event.reply(
+                "🧪 Prueba registrada en Activaciones e Historial. "
+                "No se activó ni se quitó ningún día a usuarios reales.")
+            return
         match = re.fullmatch(r"/(pagado|revision|entregado|vendido|cancelar|estado)\s+(V-\d{6,})", texto, re.I)
         if match:
             accion, pedido_id = match.group(1).lower(), match.group(2).upper()
@@ -869,7 +930,10 @@ class BotBanca:
                               "/entregado V-000001 — voucher o créditos enviados\n"
                               "/vendido V-000001 — igual que /entregado\n"
                               "/cancelar V-000001 — cancelar\n\n"
-                              "Para avisar que entregaste un voucher, usa /entregado en el privado del cliente.")
+                              "En el privado del cliente: actívate, /prueba, /desactivar.\n"
+                              "/prueba solo SIMULA en el grupo, no modifica licencias.\n"
+                              "/desactivar no quita días hasta integrar una API de revocación.\n"
+                              "/prueba en el grupo: verifica las notificaciones SIN tocar la API.")
 
     def recordar_envio(self, uid, mensajes):
         if not isinstance(mensajes, (tuple, list)):
@@ -965,6 +1029,23 @@ class BotBanca:
                 await self.avisar(f"ID {uid} no tiene activación incierta.")
             return
 
+        if texto in ("/prueba", "/prueba licencia", "/testlicencia"):
+            await self.eliminar_comando(event)
+            detalle = ("Prueba de flujo: ejemplo +30 días => ACTIVA; "
+                       "ejemplo -30 días => DESACTIVADA. "
+                       "No se llamó a la API, no se alteró ningún saldo ni se avisó al cliente.")
+            self.registrar_resultado_activacion(uid, "simulacion", detalle=detalle)
+            return
+
+        if texto in ("/desactivar", "/quitar", "/quitar 30"):
+            await self.eliminar_comando(event)
+            await self.avisar(
+                f"⚠️ DESACTIVACIÓN NO EJECUTADA para ID {uid}: la API configurada "
+                "solo tiene /api/add_days. Falta un endpoint confirmado para "
+                "quitar/revocar días; no se modificó la licencia.", tema="activaciones"
+            )
+            return
+
         if es_orden_activar(texto):
             # En respuesta, valida que el mensaje citado pertenezca al cliente;
             # nunca activamos al autor equivocado o al responder al propio bot.
@@ -974,10 +1055,10 @@ class BotBanca:
                     citado = await event.get_reply_message()
                 except Exception:
                     logger.exception("No se pudo verificar la respuesta citada en %s", uid)
-                    await self.avisar(f"⚠️ No se activó a {uid}: no pude verificar el mensaje respondido.")
+                    await self.avisar(f"⚠️ No se activó a {uid}: no pude verificar el mensaje respondido.", tema="activaciones")
                     return
                 if citado is None or int(getattr(citado, "sender_id", 0) or 0) != int(uid):
-                    await self.avisar(f"⚠️ No se activó a {uid}: responde al mensaje ORIGINAL del cliente.")
+                    await self.avisar(f"⚠️ No se activó a {uid}: responde al mensaje ORIGINAL del cliente.", tema="activaciones")
                     return
             await self.eliminar_comando(event)
             await self.activar_cliente(event, uid, responder_a=respuesta_id)
@@ -1021,14 +1102,10 @@ class BotBanca:
     async def activar_cliente(self, event, uid, *, responder_a=None):
         lock = self.locks_activacion.setdefault(uid, asyncio.Lock())
         async with lock:
-            producto = self.estado_cliente(uid).get("producto", "banca")
-            if producto in ("creditos", "vouchers", "otro"):
-                await self.avisar(
-                    f"⚠️ ID {uid}: pedido de {PRODUCTOS_COMPRA[producto]['nombre']}. "
-                    "/activate solo activa los 30 días de BOT DE BANCA; "
-                    "este pedido necesita revisión y entrega por un asesor."
-                )
-                return
+            # La licencia se vincula al ID de Telegram, no a la última categoría
+            # comercial. Un pedido de VOUCHERS o CRÉDITOS no bloquea /activate.
+            # Solo la API decide si la cuenta puede recibir los 30 días.
+            producto = self.estado_cliente(uid).get("producto", "sin pedido")
             datos = self.datos_chat(uid)
             operacion = datos.get("operacion", {})
             if operacion.get("estado") in ("en_curso", "incierta"):
@@ -1071,11 +1148,13 @@ class BotBanca:
                 except Exception:
                     logger.exception("Fallo aviso de registro al cliente %s", uid)
                     await self.avisar(f"⚠️ ID {uid} NO registrado; no pude notificarle.")
-                await self.avisar(f"❌ ID {uid}: LICENCIA NO ACTIVADA. Usuario sin registro en la API. {str(exc)[:250]}")
+                self.registrar_resultado_activacion(
+                    uid, "no_registrado", detalle=str(exc)[:250])
                 return
             except ApiRechazo as exc:
                 self.actualizar_chat(uid, operacion={"estado": "rechazada", "fecha": ahora_iso()})
-                await self.avisar(f"❌ La API rechazó activar ID {uid}: {str(exc)[:350]}")
+                self.registrar_resultado_activacion(
+                    uid, "rechazada", detalle=str(exc)[:350])
                 try:
                     await self.enviar_automatico(
                         event,
@@ -1090,11 +1169,9 @@ class BotBanca:
             except Exception as exc:
                 logger.warning("Activación incierta %s: %s", uid, exc)
                 self.actualizar_chat(uid, operacion={"estado": "incierta", "fecha": ahora_iso()})
-                await self.avisar(
-                    f"⚠️ Activación SIN CONFIRMAR para {uid}: {str(exc)[:350]}\n"
-                    "Revisa el panel de activaciones antes de reintentar. "
-                    "Si confirmas que NO se agregó, usa /desbloquear y luego /activate."
-                )
+                self.registrar_resultado_activacion(
+                    uid, "incierta", detalle=(f"{str(exc)[:250]}. "
+                         "Revisar panel antes de /desbloquear y repetir."))
                 try:
                     await self.enviar_automatico(
                         event,
@@ -1123,22 +1200,22 @@ class BotBanca:
                     f"🚨 API ACTIVÓ ID {uid}, pero falló el guardado local: {exc}. "
                     "NO repitas la activación; revisa el historial."
                 )
-            # Un error del grupo o del archivo de ventas no debe impedir avisar
-            # al comprador: la API ya completó la activación.
+            # Registrar el éxito de licencia sin fabricar una venta bancaria ni
+            # cancelar el pedido VOUCHERS existente.
             try:
                 venta = self.venta_actual(uid)
                 if venta and venta.get("producto") == "banca" and venta.get("estado") != "cancelado":
                     self.cambiar_estado_venta(
                         venta["id"], "entregado", "Activación de 30 días confirmada por la API"
                     )
-                else:
-                    venta, _ = self.nueva_venta(uid, "banca", cliente_nombre="Cliente activado manualmente")
-                    self.cambiar_estado_venta(
-                        venta["id"], "entregado", "Activación directa de 30 días confirmada por API"
-                    )
+                self.registrar_resultado_activacion(
+                    uid, "confirmada", dias=DIAS,
+                    detalle="La API /api/add_days confirmó +30 días de licencia")
             except Exception:
-                logger.exception("API confirmó a %s, pero no se pudo registrar la venta", uid)
-                await self.avisar(f"⚠️ ID {uid} activado, pero falló el historial de ventas; revisar registro.")
+                logger.exception("API confirmó a %s, pero falló el historial local", uid)
+                await self.avisar(
+                    f"⚠️ API confirmó a {uid}, pero falló el registro de ventas. No repetir la activación.",
+                    tema="activaciones")
             try:
                 self.guardar_estado_cliente(uid, estado="entregado", recordatorio_pendiente=False)
             except OSError:
@@ -1155,7 +1232,7 @@ class BotBanca:
             except Exception:
                 logger.exception("API activó, pero falló la confirmación a %s", uid)
                 await self.avisar(f"⚠️ ID {uid} activado en API, pero el mensaje al cliente falló.")
-            await self.avisar(f"✅ API confirmó {DIAS} días para ID {uid}. Chat OFF.")
+            logger.info("API confirmó %s días para ID %s; registro enviado al grupo", DIAS, uid)
 
     async def preparar_qr(self):
         if QR_FILE.is_file() and QR_FILE.stat().st_size > 0:
@@ -1461,7 +1538,7 @@ class BotBanca:
                     return
                 cuenta = await self.client.get_me()
                 self.mi_id = cuenta.id
-                logger.info("BOT BANCA activo con %s | S/ 5, 30 días", cuenta.first_name)
+                logger.info("BOT BANCA activo con %s | S/ 5, licencia 30 días | AVISOS AL GRUPO", cuenta.first_name)
                 self.tarea_recordatorios = asyncio.create_task(self.revisar_recordatorios())
                 self.tarea_grupo = asyncio.create_task(self.loop_registro_ventas())
                 await self.client.run_until_disconnected()
