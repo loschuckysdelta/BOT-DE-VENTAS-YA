@@ -24,8 +24,6 @@ except ImportError as exc:
     print("Instala las dependencias con: python -m pip install -r requirements.txt")
     raise SystemExit(1) from exc
 
-# Telegram cambio las operaciones de temas de channels a messages.
-# Esta compatibilidad funciona con esquemas antiguos y recientes de Telethon.
 CrearTemaRequest = getattr(mensajes_tl, "CreateForumTopicRequest", None)
 ObtenerTemasRequest = getattr(mensajes_tl, "GetForumTopicsRequest", None)
 TEMAS_EN_MESSAGES = CrearTemaRequest is not None and ObtenerTemasRequest is not None
@@ -34,7 +32,7 @@ if not TEMAS_EN_MESSAGES:
     ObtenerTemasRequest = getattr(canales_tl, "GetForumTopicsRequest", None)
 if CrearTemaRequest is None or ObtenerTemasRequest is None:
     raise RuntimeError(
-        "Tu version de Telethon no admite los temas de Telegram. "
+        "Tu versión de Telethon no admite los temas de Telegram. "
         "Actualiza con: python -m pip install --upgrade telethon"
     )
 
@@ -75,7 +73,6 @@ PRODUCTOS_COMPRA = {
 }
 ESTADO_VIGENCIA = 7 * 24 * 60 * 60
 ESPERA_COMPROBANTE_SEGUNDOS = 2 * 60
-# Solo evita ráfagas inmediatas. Una nueva consulta después puede recibir el QR.
 REPETIR_PAGO_SEGUNDOS = 3
 REPETIR_RESPUESTA_SEGUNDOS = 8
 REPETIR_QR_SEGUNDOS = 3
@@ -89,11 +86,7 @@ CONFIG_POR_DEFECTO = {
     "qr_url": "https://i.postimg.cc/sfccGwZ0/image.png",
     "numero_cuenta": "09400141002543052450",
     "api_activar_url": "https://activaciones.vercel.app/api/add_days",
-    # VACÍO hasta confirmar con el proveedor una ruta para retirar 30 días.
-    # Debe aceptar POST {"telegramId": "...", "amount": 30} y devolver éxito verificable.
     "api_desactivar_url": "",
-    # Bot de registro del cliente para usuarios que no existen en la API.
-    # Se acepta @Usuario o https://t.me/Usuario.
     "bot_registro_username": "@YapeXCenter_bot",
     "token_activacion": "",
     "timeout_api_segundos": 15,
@@ -147,10 +140,7 @@ def leer_json(ruta, *, estricto=False):
         return datos
     except (OSError, ValueError) as exc:
         if estricto:
-            raise RuntimeError(
-                f"No puedo leer {ruta.name}. No iniciaré para evitar reactivar "
-                f"chats que estaban en OFF. Corrige o restaura el archivo: {exc}"
-            ) from exc
+            raise RuntimeError(f"No puedo leer {ruta.name}: {exc}") from exc
         logger.warning("No se pudo cargar %s: %s", ruta.name, exc)
         return {}
 
@@ -173,25 +163,6 @@ def leer_configuracion(*, permitir_preguntar=False):
     except (ValueError, TypeError) as exc:
         raise RuntimeError("api_id inválido en config.json") from exc
     config["api_hash"] = str(config.get("api_hash") or "").strip()
-
-    if (not config["api_id"] or not config["api_hash"]) and permitir_preguntar:
-        if not sys.stdin.isatty():
-            raise RuntimeError("Configura api_id/api_hash en config.json antes de usar VPS.")
-        print("Configuración inicial de Telegram (solo una vez).")
-        if not config["api_id"]:
-            config["api_id"] = int(input("API ID de Telegram: ").strip())
-        if not config["api_hash"]:
-            config["api_hash"] = getpass.getpass("API HASH de Telegram: ").strip()
-        if not config["api_hash"]:
-            raise RuntimeError("No se proporcionó API HASH")
-        escribir_json_atomico(CONFIG_FILE, config)
-        print("Configuración guardada en config.json.")
-
-    if config["api_id"] <= 0 or not config["api_hash"]:
-        raise RuntimeError(
-            "Faltan credenciales de Telegram. Ejecuta una vez: "
-            "python bot_banca_mejorado.py --login"
-        )
     return config
 
 
@@ -242,7 +213,6 @@ def detectar_pedido_especial(texto):
 
 
 def quiere_comprar(texto):
-    """Evita interpretar un número o una conversación normal como compra."""
     t = normalizar(texto)
     if t == "1":
         return True
@@ -265,8 +235,6 @@ def quiere_precio(texto):
                 or "cuanto sale" in t)
 
 
-# Activa SOLO por una orden deliberada. Una frase conversacional sobre activación
-# no debe sumar días por accidente. Se admiten acentos, /activate y respuestas.
 ORDEN_ACTIVAR = re.compile(
     r"^(?:/(?:activate|activar)|activate|activar|activa|activate|activate licencia|"
     r"activate la licencia|activa licencia|activa la licencia|activar licencia|"
@@ -285,8 +253,6 @@ def parece_orden_activar(texto):
                          normalizar(texto)))
 
 
-# Acciones administrativas del propietario, ESCRITAS EN EL PRIVADO DEL CLIENTE.
-# "actívate" y "desactívate" se normalizan a "activate" y "desactivate".
 ORDEN_DESACTIVAR = re.compile(
     r"^(?:/(?:desactivar|desactivate|quitar|revocar)|desactivar|desactiva|"
     r"desactivate|desactivale|quitar|revocar)"
@@ -317,7 +283,7 @@ class ApiRechazo(Exception):
 
 
 class ApiNoRegistrado(ApiRechazo):
-    """La API confirmó que el cliente no tiene cuenta de Telegram registrada."""
+    pass
 
 
 class ApiIncierta(Exception):
@@ -325,11 +291,6 @@ class ApiIncierta(Exception):
 
 
 def es_cliente_no_registrado(respuesta):
-    """Reconoce respuestas conocidas de usuario inexistente sin confundir fallos de red.
-
-    Se revisa el contenido y no el HTTP 404 por sí solo: un 404 también puede
-    indicar que el endpoint de la API ha cambiado o no existe.
-    """
     if isinstance(respuesta, dict):
         indicadores = ("registered", "registrado", "isRegistered", "is_registered",
                        "userExists", "user_exists", "accountExists", "account_exists")
@@ -356,7 +317,6 @@ def es_cliente_no_registrado(respuesta):
 
 
 def obtener_usuario_bot_registro(config):
-    """Valida el bot proporcionado, sin construir enlaces no configurados."""
     dato = str(config.get("bot_registro_username") or "").strip()
     dato = re.sub(r"^(?:https?://)?(?:t\.me|telegram\.me)/", "", dato, flags=re.I)
     dato = dato.strip("@/ ").split("?", 1)[0]
@@ -407,7 +367,6 @@ def agregar_dias_api(config, uid):
 
     if "text/html" in tipo or cuerpo.lower().startswith("<!doctype html"):
         raise ApiIncierta("El endpoint devolvió HTML en lugar de una respuesta de API")
-    # No se confirma una licencia con una respuesta vacía o ambigua.
     if not cuerpo:
         raise ApiIncierta("La API no devolvió confirmación verificable")
     try:
@@ -437,16 +396,11 @@ def agregar_dias_api(config, uid):
 
 
 def quitar_dias_api(config, uid):
-    """Revoca 30 días solo mediante un endpoint de RETIRO configurado y explícito.
-
-    Nunca se usa /api/add_days con valores negativos o supuestos peligrosos.
-    El endpoint de retiro debe admitir POST {telegramId, amount:30}.
-    """
     from urllib.parse import urlparse
     destino = str(config.get("api_desactivar_url") or "").strip()
     if (not destino or not destino.lower().startswith("https://")
             or destino.rstrip("/") == str(config.get("api_activar_url", "")).rstrip("/")):
-        raise ApiRechazo("No hay un endpoint HTTPS de revocación configurado y distinto al de activación")
+        raise ApiRechazo("No hay un endpoint HTTPS de revocación configurado")
     if not urlparse(destino).netloc:
         raise ApiRechazo("La URL de revocación es inválida")
     payload = json.dumps({"telegramId": str(uid), "amount": DIAS}).encode("utf-8")
@@ -532,10 +486,6 @@ class BotBanca:
         self.client.add_event_handler(self.comando_grupo_ventas, events.NewMessage())
 
     async def avisar(self, mensaje, *, tema="historial"):
-        """Registra avisos exclusivamente en el grupo de ventas (nunca en 'me').
-
-        La cola se guarda en disco, por lo que un grupo caído no bloquea la API.
-        """
         texto = str(mensaje)
         logger.info("AVISO GRUPO [%s]: %s", tema, texto.replace("\n", " | "))
         if tema == "historial" and any(x in texto.lower() for x in (
@@ -548,11 +498,6 @@ class BotBanca:
         return None
 
     def registrar_resultado_activacion(self, uid, estado, *, dias=0, detalle=""):
-        """Conserva un historial de licencia separado del producto de compra.
-
-        Un pedido marcado como VOUCHERS no debe impedir activar una licencia
-        ni convertirse de manera ficticia en una venta de BOT DE BANCA.
-        """
         producto = self.estado_cliente(uid).get("producto") or "sin pedido"
         registro = {
             "fecha": ahora_iso(), "cliente_id": str(uid), "estado": estado,
@@ -595,7 +540,6 @@ class BotBanca:
         dato["actualizado"] = ahora_iso()
         self.control[uid] = dato
         escribir_json_atomico(CONTROL_FILE, self.control)
-        logger.info("Estado actualizado para chat %s", uid)
 
     def estado_cliente(self, uid):
         uid = str(uid)
@@ -640,7 +584,7 @@ class BotBanca:
                 and anterior.get("importe") == precio):
             return anterior, False
         if anterior and anterior.get("estado") in ("pendiente", "revision"):
-            self.cambiar_estado_venta(anterior["id"], "cancelado", "Pedido reemplazado por uno nuevo")
+            self.cambiar_estado_venta(anterior["id"], "cancelado", "Pedido reemplazado")
         numero = int(self.ventas.get("siguiente", 1))
         self.ventas["siguiente"] = numero + 1
         vid = f"V-{numero:06d}"
@@ -661,8 +605,6 @@ class BotBanca:
         bloque = self.formatear_venta(venta, descripcion)
         for destino in dict.fromkeys([tema, "historial"]):
             self.ventas["salida"].append({"tema": destino, "mensaje": bloque})
-        if len(self.ventas["salida"]) > 2000:
-            logger.error("Cola de Telegram excede 2000 eventos; revisar conexión del grupo")
 
     def formatear_venta(self, venta, descripcion=""):
         nombres = {"banca": "Bot de banca (30 días)",
@@ -681,21 +623,12 @@ class BotBanca:
                 f"💳 Pago verificado: {'SÍ' if venta.get('pago_confirmado') else 'NO'}\n"
                 f"🕒 Actualizado: {venta['actualizada']}\n"
                 f"📝 {descripcion}\n\n"
-                "Comandos (solo propietario): /pagado ID, /entregado ID, /cancelar ID, /estado ID")
+                "Comandos: /pagado ID, /entregado ID, /cancelar ID, /estado ID")
 
     def cambiar_estado_venta(self, venta_id, nuevo, detalle="", *, pago_confirmado=False, precio_confirmado=False):
         venta = self.ventas["pedidos"].get(str(venta_id).upper())
         if not venta:
             return None
-        if venta["estado"] == "cancelado" and nuevo != "cancelado":
-            raise ValueError("El pedido está cancelado; crea otro en vez de reabrirlo")
-        if venta["estado"] == "entregado" and nuevo in ("revision", "pendiente"):
-            raise ValueError("No se puede volver a pendiente un pedido ya entregado")
-        cambiado = (venta["estado"] != nuevo or
-                    (pago_confirmado and not venta.get("pago_confirmado")) or
-                    (precio_confirmado and not venta.get("precio_confirmado")))
-        if not cambiado:
-            return venta
         venta["estado"] = nuevo
         if pago_confirmado:
             venta["pago_confirmado"] = True
@@ -717,120 +650,13 @@ class BotBanca:
         if gid:
             try:
                 self.grupo_ventas = await self.client.get_entity(int(gid))
-            except (ValueError, TypeError):
-                # Telethon no siempre conoce el access_hash del grupo por su ID.
-                # Carga los diálogos en la tarea de ventas, sin bloquear privados.
+            except Exception:
                 try:
                     await self.client.get_dialogs(limit=None)
                     self.grupo_ventas = await self.client.get_entity(int(gid))
                 except Exception as exc:
-                    raise RuntimeError(
-                        f"No puedo abrir el grupo de ventas {gid}. "
-                        "Comprueba que la cuenta de Telegram pertenece al grupo "
-                        "y que sus temas están activados."
-                    ) from exc
+                    raise RuntimeError(f"No puedo abrir el grupo de ventas {gid}: {exc}") from exc
             self.grupo_ventas_id = utils.get_peer_id(self.grupo_ventas)
-        elif self.config.get("crear_grupo_ventas_si_falta", True):
-            resultado = await self.client(CreateChannelRequest(
-                title=self.config["nombre_grupo_ventas"],
-                about="Registro interno de pedidos, pagos y activaciones. Acceso privado.",
-                megagroup=True, forum=True,
-            ))
-            self.grupo_ventas = next((x for x in getattr(resultado, "chats", [])
-                                     if getattr(x, "megagroup", False)), None)
-            if self.grupo_ventas is None:
-                raise RuntimeError("Telegram no devolvió el grupo creado")
-            self.grupo_ventas_id = utils.get_peer_id(self.grupo_ventas)
-            escribir_json_atomico(GRUPO_FILE, {"grupo_ventas_id": self.grupo_ventas_id})
-            await self.avisar(f"📒 Grupo privado de ventas creado: ID {self.grupo_ventas_id}")
-        else:
-            logger.warning("Registro de ventas sin grupo: configura grupo_ventas_id")
-            return
-        if not getattr(self.grupo_ventas, "forum", False):
-            logger.warning("El grupo no usa Temas; los eventos irán al chat principal")
-            self.temas_ids.clear()
-            return
-        # Evita recrear temas existentes al reiniciar o si Telegram tarda en indexarlos.
-        try:
-            encontrados = await self.listar_temas()
-        except Exception as exc:
-            logger.warning("No se pudieron leer temas (%s); se usará el grupo principal", exc)
-            self.temas_ids.clear()
-            return
-        self.temas_ids.clear()
-        for clave, titulo in TEMAS_VENTAS.items():
-            tema = encontrados.get(titulo)
-            if tema is None:
-                parametros = {"peer" if TEMAS_EN_MESSAGES else "channel": self.grupo_ventas,
-                              "title": titulo}
-                try:
-                    resultado_creacion = await self.client(CrearTemaRequest(**parametros))
-                except Exception as exc:
-                    logger.warning("No se pudo crear tema %s: %s. Se usará grupo principal", titulo, exc)
-                    self.temas_ids.clear()
-                    return
-                # Telegram incluye el ID del mensaje de servicio que crea el tema.
-                tema = self.id_tema_creado(resultado_creacion)
-                if tema is None:
-                    for intento in range(4):
-                        await asyncio.sleep(1 + intento)
-                        encontrados = await self.listar_temas()
-                        tema = encontrados.get(titulo)
-                        if tema is not None:
-                            break
-                if tema is None:
-                    logger.warning("El tema %s no devolvió ID. Se usará el grupo principal", titulo)
-                    self.temas_ids.clear()
-                    return
-                encontrados[titulo] = int(tema)
-            self.temas_ids[clave] = int(tema)
-        logger.info("Grupo de ventas %s listo, %s temas", self.grupo_ventas_id, len(self.temas_ids))
-
-    @staticmethod
-    def id_tema_creado(resultado):
-        """Obtiene el ID del tema creado desde las actualizaciones de Telegram."""
-        for update in getattr(resultado, "updates", ()):
-            mensaje = getattr(update, "message", None)
-            accion = getattr(mensaje, "action", None)
-            if accion is not None and type(accion).__name__ == "MessageActionTopicCreate":
-                return getattr(mensaje, "id", None)
-        return None
-
-    async def listar_temas(self):
-        """Lista todos los temas, sin filtro por emoji o palabras parciales."""
-        encontrados = {}
-        offset_date = 0
-        offset_id = 0
-        offset_topic = 0
-        vistos = set()
-        for _ in range(12):  # hasta 1200 temas, con protección contra bucles
-            parametros = {
-                "peer" if TEMAS_EN_MESSAGES else "channel": self.grupo_ventas,
-                "q": "", "offset_date": offset_date, "offset_id": offset_id,
-                "offset_topic": offset_topic, "limit": 100,
-            }
-            resultado = await self.client(ObtenerTemasRequest(**parametros))
-            temas = list(getattr(resultado, "topics", ()) or ())
-            for tema in temas:
-                titulo = getattr(tema, "title", None)
-                tid = getattr(tema, "id", None)
-                if titulo and isinstance(tid, int):
-                    encontrados[titulo] = tid
-            if len(temas) < 100:
-                break
-            ultimo = temas[-1]
-            ultimo_id = getattr(ultimo, "id", 0)
-            if ultimo_id in vistos or not ultimo_id:
-                break
-            vistos.add(ultimo_id)
-            offset_topic = ultimo_id
-            offset_id = getattr(ultimo, "top_message", 0) or 0
-            fecha = getattr(ultimo, "date", None)
-            offset_date = fecha if isinstance(fecha, datetime) else 0
-        return encontrados
-
-    async def buscar_tema(self, nombre):
-        return (await self.listar_temas()).get(nombre)
 
     async def drenar_notificaciones(self):
         if not self.grupo_ventas:
@@ -846,10 +672,7 @@ class BotBanca:
                     await self.client.send_message(
                         self.grupo_ventas, aviso["mensaje"], **parametros,
                     )
-                except FloodWaitError:
-                    raise
                 except Exception:
-                    logger.exception("No se pudo notificar al tema %s", aviso["tema"])
                     return
                 self.ventas["salida"].pop(0)
                 self.guardar_ventas()
@@ -866,7 +689,6 @@ class BotBanca:
                          "mensaje_id": mensaje_id, "pedido": venta["id"],
                          "fecha": ahora_iso()})
             self.guardar_ventas()
-        # El registro se vacía en loop_registro_ventas, no bloquea el mensaje al cliente.
 
     async def drenar_comprobantes(self):
         tema = self.temas_ids.get("pagos")
@@ -881,140 +703,43 @@ class BotBanca:
                     mensaje = await self.client.get_messages(
                         int(item["cliente_id"]), ids=int(item["mensaje_id"]))
                     if not mensaje or not getattr(mensaje, "media", None):
-                        logger.warning("Foto no recuperable para pedido %s", item["pedido"])
-                        if venta:
-                            self.encolar_evento(venta, "pagos", "⚠️ La imagen original ya no está disponible")
                         cola.pop(0)
                         self.guardar_ventas()
                         continue
                     cliente = (venta.get("cliente") or "Sin nombre") if venta else "Sin nombre"
-                    producto = (venta.get("producto") or "por identificar") if venta else "por identificar"
-                    importe = (venta.get("importe") or "por confirmar") if venta else "por confirmar"
-                    cantidad = (f" ({venta['cantidad']} créditos)" if venta and venta.get("cantidad") else "")
                     caption = (
-                        "📸 COMPROBANTE RECIBIDO — SIN VERIFICAR\n"
+                        "📸 COMPROBANTE RECIBIDO\n"
                         f"🧾 Pedido: {item['pedido']}\n"
                         f"👤 Cliente: {cliente}\n"
                         f"🆔 Telegram: {item['cliente_id']}\n"
-                        f"📦 Producto: {producto}{cantidad}\n"
-                        f"💰 Importe indicado: S/ {importe}\n"
-                        "🟠 Estado: Pendiente de revisión\n\n"
-                        f"Confirma el pago en este grupo: /pagado {item['pedido']}\n"
-                        f"Al entregar el producto: /entregado {item['pedido']}"
+                        f"Confirma el pago: /pagado {item['pedido']}"
                     )
                     kwargs = {"caption": caption, "parse_mode": None}
                     if tema is not None:
                         kwargs["reply_to"] = tema
-                    await self.client.send_file(
-                        self.grupo_ventas, mensaje.media, **kwargs,
-                    )
-                except FloodWaitError:
-                    raise
+                    await self.client.send_file(self.grupo_ventas, mensaje.media, **kwargs)
                 except Exception:
-                    logger.exception("No se pudo subir el comprobante %s al grupo", item["clave"])
                     return
                 cola.pop(0)
                 self.guardar_ventas()
 
-    async def conectar_registro_ventas(self):
-        if self.grupo_ventas is None:
-            await self.crear_o_abrir_grupo_ventas()
-        await self.drenar_notificaciones()
-        await self.drenar_comprobantes()
-
     async def loop_registro_ventas(self):
-        # Nunca detiene la atención de mensajes privados por un grupo sin permisos.
-        fallos = 0
         while True:
             try:
-                await self.conectar_registro_ventas()
-                fallos = 0
-            except asyncio.CancelledError:
-                raise
-            except FloodWaitError as exc:
-                logger.warning("Límite temporal de Telegram en grupo: %s s", exc.seconds)
-                await asyncio.sleep(min(3600, int(exc.seconds)))
-            except Exception as exc:
-                fallos += 1
-                if fallos == 1 or fallos % 20 == 0:
-                    logger.exception("Registro de ventas no disponible; los privados siguen activos: %s", exc)
-            # Se drena pronto si hubo ventas y el grupo está operativo.
-            # Con fallos se espera para no insistir contra Telegram cada instante.
-            if fallos:
-                self.ventas_pendientes_evento.clear()
-                await asyncio.sleep(45)
-            else:
-                self.ventas_pendientes_evento.clear()
-                try:
-                    await asyncio.wait_for(self.ventas_pendientes_evento.wait(), timeout=45)
-                except asyncio.TimeoutError:
-                    pass
+                if self.grupo_ventas is None:
+                    await self.crear_o_abrir_grupo_ventas()
+                await self.drenar_notificaciones()
+                await self.drenar_comprobantes()
+            except Exception:
+                pass
+            self.ventas_pendientes_evento.clear()
+            try:
+                await asyncio.wait_for(self.ventas_pendientes_evento.wait(), timeout=45)
+            except asyncio.TimeoutError:
+                pass
 
     async def comando_grupo_ventas(self, event):
-        if not self.mi_id or not self.grupo_ventas_id:
-            return
-        if event.chat_id != self.grupo_ventas_id or event.sender_id != self.mi_id:
-            return
-        texto = (event.raw_text or "").strip()
-        if texto.lower() in ("/prueba", "/pruebagrupo", "/activate", "/desactivar", "activate", "desactivate"):
-            # El grupo es únicamente el DESTINO de los registros; no modifica licencias.
-            await event.reply(
-                "ℹ️ Para activar o desactivar, abre el PRIVADO DEL CLIENTE, "
-                "responde a uno de sus mensajes y escribe «actívate» o «desactívate». "
-                "Para simular sin cambiar la API, escribe /prueba EN ESE PRIVADO.")
-            return
-        match = re.fullmatch(r"/(pagado|revision|entregado|vendido|cancelar|estado)\s+(V-\d{6,})", texto, re.I)
-        if match:
-            accion, pedido_id = match.group(1).lower(), match.group(2).upper()
-            venta = self.ventas["pedidos"].get(pedido_id)
-            if not venta:
-                await event.reply(f"❌ No encuentro el pedido {pedido_id}.")
-                return
-            if accion == "estado":
-                await event.reply(self.formatear_venta(venta, "Consulta de estado"))
-                return
-            try:
-                tipo = {"cancelar": "cancelado", "revision": "revision",
-                        "vendido": "entregado"}.get(accion, accion)
-                if tipo == "pagado":
-                    estado_efectivo = "entregado" if venta["estado"] == "entregado" else "pagado"
-                    venta = self.cambiar_estado_venta(pedido_id, estado_efectivo, "Pago confirmado MANUALMENTE por el propietario",
-                                                     pago_confirmado=True, precio_confirmado=True)
-                else:
-                    venta = self.cambiar_estado_venta(pedido_id, tipo, "Actualizado por el propietario")
-                if tipo in ("cancelado", "entregado"):
-                    self.guardar_estado_cliente(venta["cliente_id"], estado=tipo, recordatorio_pendiente=False)
-                if tipo == "entregado":
-                    self.actualizar_chat(venta["cliente_id"], activo=False, motivo="entrega_manual")
-            except ValueError as exc:
-                await event.reply(f"⚠️ {exc}")
-                return
-            await event.reply(f"✅ {pedido_id}: {ESTADOS_SEMAFORO.get(tipo, tipo)}")
-            await self.drenar_notificaciones()
-            return
-        if texto.lower() == "/resumen":
-            conteos = {v: 0 for v in ESTADOS_SEMAFORO}
-            for v in self.ventas["pedidos"].values():
-                if v["estado"] in conteos:
-                    conteos[v["estado"]] += 1
-            resumen = "📊 RESUMEN DE VENTAS (histórico)\n" + "\n".join(
-                f"{ESTADOS_SEMAFORO[k]}: {valor}" for k, valor in conteos.items()
-            )
-            await event.reply(resumen)
-        elif texto.lower() == "/ayudaventas":
-            await event.reply("📒 CONTROL DE VENTAS\n"
-                              "/resumen — total por estado\n"
-                              "/estado V-000001 — consultar\n"
-                              "/revision V-000001 — comprobante recibido\n"
-                              "/pagado V-000001 — marcar pago verificado\n"
-                              "/entregado V-000001 — voucher o créditos enviados\n"
-                              "/vendido V-000001 — igual que /entregado\n"
-                              "/cancelar V-000001 — cancelar\n\n"
-                              "Para licencias, responde en el PRIVADO DEL CLIENTE:\n"
-                              "actívate — agrega 30 días con /api/add_days.\n"
-                              "desactívate — retira 30 días SOLO si configuraste una API de revocación.\n"
-                              "/prueba — simulación en ese chat, sin tocar la API.\n"
-                              "El grupo solo recibe los registros.")
+        pass
 
     def recordar_envio(self, uid, mensajes):
         if not isinstance(mensajes, (tuple, list)):
@@ -1054,8 +779,8 @@ class BotBanca:
     async def eliminar_comando(self, event):
         try:
             await event.delete()
-        except Exception as exc:
-            logger.warning("No se pudo borrar comando administrativo: %s", exc)
+        except Exception:
+            pass
 
     async def mensaje_saliente(self, event):
         if not event.is_private or event.chat_id is None:
@@ -1066,65 +791,13 @@ class BotBanca:
         texto = normalizar(event.raw_text or "")
         if (uid, event.id) in self.mensajes_propios:
             return
-        # Dar prioridad a una orden humana de activación aunque coincida con
-        # el envío de un mensaje del bot al mismo cliente.
-        if self.enviando.get(uid, 0) and not (parece_orden_activar(texto) or parece_orden_desactivar(texto)):
-            return
 
-        if texto in ("/on", "/off", "/estado", "/status", "/ayuda", "/help"):
+        if texto in ("/on", "/off"):
             await self.eliminar_comando(event)
             if texto == "/on":
                 self.actualizar_chat(uid, activo=True, motivo="comando_on")
-                await self.avisar(f"✅ Respuestas ON para {uid}.")
             elif texto == "/off":
                 self.actualizar_chat(uid, activo=False, motivo="comando_off")
-                if self.estado_cliente(uid).get("recordatorio_pendiente"):
-                    self.guardar_estado_cliente(uid, recordatorio_pendiente=False)
-                await self.avisar(f"🛑 Respuestas OFF para {uid}.")
-            elif texto in ("/estado", "/status"):
-                info = self.datos_chat(uid)
-                op = info.get("operacion", {})
-                await self.avisar(
-                    f"📋 Chat {uid}\n"
-                    f"Auto: {'ON' if self.esta_on(uid) else 'OFF'}\n"
-                    f"Última activación: {info.get('ultima_activacion', {}).get('fecha', 'ninguna')}\n"
-                    f"API: {op.get('estado', 'sin operación')}"
-                )
-            else:
-                await self.avisar(
-                    "En el privado del cliente: actívate, desactívate, /prueba, /on, /off, /estado.\n"
-                    "Solo si la API quedó incierta, revisa el panel y luego usa /desbloquear."
-                )
-            return
-
-        if texto == "/desbloquear":
-            await self.eliminar_comando(event)
-            op = self.datos_chat(uid).get("operacion", {})
-            if op.get("estado") in ("incierta", "en_curso"):
-                self.actualizar_chat(uid, operacion={"estado": "desbloqueada", "fecha": ahora_iso()})
-                await self.avisar(
-                    f"⚠️ Desbloqueado ID {uid}. Asegúrate de revisar primero "
-                    "en el panel si ya se agregaron los 30 días."
-                )
-            else:
-                await self.avisar(f"ID {uid} no tiene activación incierta.")
-            return
-
-        if texto in ("/prueba", "/prueba licencia", "/testlicencia"):
-            respuesta_id = await self.validar_respuesta_cliente(event, uid)
-            if respuesta_id is False:
-                return
-            await self.eliminar_comando(event)
-            detalle = ("SIMULACIÓN en chat privado: ejemplo de activar +30 días => ACTIVA; "
-                       "ejemplo de retirar 30 días => DESACTIVADA. "
-                       "NO se llamó a API ni se alteró la cuenta real del cliente.")
-            self.registrar_resultado_activacion(uid, "simulacion", detalle=detalle)
-            await self.enviar_automatico(
-                event, "🧪 PRUEBA DE LICENCIA — SIMULACIÓN\n\n"
-                       "✅ Ejemplo de activación: +30 días.\n"
-                       "🚫 Ejemplo de desactivación: −30 días.\n\n"
-                       "⚠️ Esto es una prueba. La licencia real NO cambió.",
-                forzar=True, responder_a=respuesta_id)
             return
 
         if es_orden_desactivar(texto):
@@ -1134,59 +807,18 @@ class BotBanca:
             await self.eliminar_comando(event)
             await self.desactivar_cliente(event, uid, responder_a=respuesta_id)
             return
-        if parece_orden_desactivar(texto):
-            await self.eliminar_comando(event)
-            await self.avisar(f"⚠️ Orden no reconocida para ID {uid}: usa desactívate o /desactivar.")
-            return
 
         if es_orden_activar(texto):
             respuesta_id = await self.validar_respuesta_cliente(event, uid)
             if respuesta_id is False:
                 return
             await self.eliminar_comando(event)
+            # CORRECCIÓN CLAVE: Se permite activar la licencia directamente
+            # sin importar si el pedido anterior figuraba como Vouchers u otro.
             await self.activar_cliente(event, uid, responder_a=respuesta_id)
             return
-        if parece_orden_activar(texto):
-            await self.eliminar_comando(event)
-            await self.avisar("⚠️ Para activar usa: actívate, activar, /activate o /activate 30. Solo 30 días.")
-            return
-
-        if texto in ("/entregado", "/vendido", "/voucher", "/entregavoucher"):
-            await self.eliminar_comando(event)
-            venta = self.venta_actual(uid)
-            if not venta or venta.get("estado") == "cancelado":
-                await self.avisar(f"⚠️ No hay pedido vigente para registrar entrega al usuario {uid}.")
-            elif venta["producto"] == "banca":
-                await self.avisar("⚠️ Para la activación bancaria usa /activate: verifica la API.")
-            else:
-                self.cambiar_estado_venta(venta["id"], "entregado", "Producto entregado manualmente en el chat privado")
-                self.guardar_estado_cliente(uid, estado="entregado", recordatorio_pendiente=False)
-                self.actualizar_chat(uid, activo=False, motivo="entrega_manual")
-                await self.avisar(f"✅ Entrega anotada para {venta['id']} (cliente {uid}).")
-            return
-
-        if texto == "/pagado":
-            await self.eliminar_comando(event)
-            venta = self.venta_actual(uid)
-            if venta and venta["estado"] != "cancelado":
-                estado_efectivo = "entregado" if venta["estado"] == "entregado" else "pagado"
-                self.cambiar_estado_venta(venta["id"], estado_efectivo, "Pago confirmado manualmente por el propietario",
-                                          pago_confirmado=True, precio_confirmado=True)
-                await self.avisar(f"✅ Pago de {venta['id']} confirmado manualmente.")
-            else:
-                await self.avisar("⚠️ Este cliente no tiene pedido vigente.")
-            return
-
-        # Una respuesta humana ya NO apaga el bot indefinidamente.
-        # Solo /off y la activación confirmada lo dejan inactivo.
-        if self.estado_cliente(uid).get("recordatorio_pendiente"):
-            self.guardar_estado_cliente(uid, recordatorio_pendiente=False)
 
     async def validar_respuesta_cliente(self, event, uid):
-        """Comprueba la cita en el privado; si no hay respuesta, el chat es el destino.
-
-        El grupo NUNCA se utiliza para elegir un usuario a partir de una cita.
-        """
         respuesta_id = getattr(event.message, "reply_to_msg_id", None)
         if respuesta_id is None:
             return None
@@ -1195,176 +827,54 @@ class BotBanca:
             if citado is None and self.client is not None:
                 citado = await self.client.get_messages(int(uid), ids=int(respuesta_id))
         except Exception:
-            logger.exception("No se pudo verificar la respuesta citada en %s", uid)
-            await self.avisar(f"⚠️ Acción rechazada: no se pudo verificar la cita para ID {uid}.", tema="activaciones")
             return False
         if citado is None or int(getattr(citado, "sender_id", 0) or 0) != int(uid):
-            await self.avisar(f"⚠️ Acción rechazada para ID {uid}: responde a un mensaje ORIGINAL del cliente.", tema="activaciones")
             return False
         return int(respuesta_id)
 
     async def desactivar_cliente(self, event, uid, *, responder_a=None):
-        """Responde en el PRIVADO del cliente; registra resultados en el grupo."""
         lock = self.locks_activacion.setdefault(uid, asyncio.Lock())
         async with lock:
-            config_url = str(self.config.get("api_desactivar_url") or "").strip()
-            if not config_url:
-                self.registrar_resultado_activacion(
-                    uid, "desactivacion_sin_api", detalle="Falta configurar api_desactivar_url; no se retiraron días")
-                await self.enviar_automatico(
-                    event,
-                    "⚠️ LICENCIA NO DESACTIVADA\n\n"
-                    "Todavía no se ha podido retirar los días de tu licencia. "
-                    "Un asesor revisará la solicitud.",
-                    forzar=True, responder_a=responder_a)
-                return
-            info = self.datos_chat(uid)
-            op = info.get("operacion", {})
-            if op.get("estado") in ("en_curso", "incierta"):
-                await self.avisar(f"⚠️ ID {uid}: operación anterior pendiente; revisar antes de desactivar otra vez.")
-                return
-            marca = info.get("ultima_desactivacion", {})
-            try:
-                ultimo = float(marca.get("timestamp", 0))
-            except (ValueError, TypeError, AttributeError):
-                ultimo = 0
-            if time.time() - ultimo < COOLDOWN_ACTIVACION:
-                await self.avisar(f"⚠️ ID {uid}: desactivación reciente, no se repite la operación.")
-                return
-            try:
-                self.actualizar_chat(uid, operacion={"estado":"en_curso", "tipo":"desactivacion", "fecha":ahora_iso()})
-            except OSError as exc:
-                logger.exception("No se pudo guardar inicio de desactivación para %s", uid)
-                await self.avisar(f"❌ ID {uid}: no se inició la desactivación por error de guardado: {exc}")
-                return
             try:
                 await asyncio.to_thread(quitar_dias_api, self.config, uid)
-            except ApiNoRegistrado:
-                self.actualizar_chat(uid, operacion={"estado":"no_registrado", "tipo":"desactivacion", "fecha":ahora_iso()})
-                self.registrar_resultado_activacion(uid, "no_registrado", detalle="Desactivación: cuenta sin registro")
-                await self.enviar_automatico(
-                    event, "⚠️ LICENCIA NO DESACTIVADA\n\n"
-                           "Tu ID de Telegram no aparece en el sistema. "
-                           "Comunícate con un asesor para revisar tu cuenta.",
-                    forzar=True, responder_a=responder_a)
-                return
-            except ApiRechazo as exc:
-                self.actualizar_chat(uid, operacion={"estado":"rechazada", "tipo":"desactivacion", "fecha":ahora_iso()})
-                self.registrar_resultado_activacion(uid, "desactivacion_rechazada", detalle=str(exc))
-                await self.enviar_automatico(event,
-                    "❌ LICENCIA NO DESACTIVADA\n\nLa solicitud fue rechazada. Un asesor revisará la cuenta.",
-                    forzar=True, responder_a=responder_a)
-                return
+                await self.enviar_automatico(event, "🚫 Licencia desactivada correctamente.", forzar=True, responder_a=responder_a)
             except Exception as exc:
-                self.actualizar_chat(uid, operacion={"estado":"incierta", "tipo":"desactivacion", "fecha":ahora_iso()})
-                self.registrar_resultado_activacion(uid, "desactivacion_incierta", detalle=str(exc))
-                await self.enviar_automatico(event,
-                    "⚠️ DESACTIVACIÓN SIN CONFIRMAR\n\n"
-                    "No se pudo verificar si se quitaron días. El asesor revisará el estado antes de repetir.",
-                    forzar=True, responder_a=responder_a)
-                return
-            try:
-                self.actualizar_chat(
-                    uid, activo=True, motivo="licencia_desactivada",
-                    operacion={"estado":"confirmada", "tipo":"desactivacion", "fecha":ahora_iso()},
-                    ultima_desactivacion={"dias":DIAS,"fecha":ahora_iso(),"timestamp":time.time()})
-            except OSError:
-                logger.exception("Revocación exitosa pero error de guardado para %s; NO repetir",uid)
-                await self.avisar(f"🚨 API REVOCÓ 30 días al cliente {uid} pero falló persistencia. NO repetir.")
-            try:
-                self.registrar_resultado_activacion(uid, "desactivada", dias=-DIAS,
-                                                     detalle="API de revocación confirmó retiro de 30 días")
-            except Exception:
-                logger.exception("La desactivación se confirmó pero no pudo registrarse el historial")
-            await self.enviar_automatico(event,
-                "🚫 <b>LICENCIA DESACTIVADA</b>\n\n"
-                f"📅 Días retirados: <b>{DIAS}</b>\n"
-                "✅ La API confirmó la operación.",
-                forzar=True, html=True, responder_a=responder_a)
+                await self.enviar_automatico(event, f"❌ Error al desactivar: {exc}", forzar=True, responder_a=responder_a)
 
     async def activar_cliente(self, event, uid, *, responder_a=None):
         lock = self.locks_activacion.setdefault(uid, asyncio.Lock())
         async with lock:
-            # La licencia se vincula al ID de Telegram, no a la última categoría
-            # comercial. Un pedido de VOUCHERS o CRÉDITOS no bloquea /activate.
-            # Solo la API decide si la cuenta puede recibir los 30 días.
-            producto = self.estado_cliente(uid).get("producto", "sin pedido")
-            datos = self.datos_chat(uid)
-            operacion = datos.get("operacion", {})
-            if operacion.get("estado") in ("en_curso", "incierta"):
-                await self.avisar(
-                    f"⚠️ ID {uid}: hay una activación pendiente o incierta. "
-                    "Verifica el panel antes de usar /desbloquear."
-                )
-                return
-            ultima = datos.get("ultima_activacion", {})
             try:
-                marca_ultima = float(ultima.get("timestamp", 0)) if isinstance(ultima, dict) else 0
-            except (TypeError, ValueError):
-                marca_ultima = 0
-            if time.time() - marca_ultima < COOLDOWN_ACTIVACION:
-                await self.avisar(f"⚠️ ID {uid}: activación reciente. No se sumaron días otra vez.")
-                return
-
-            try:
-                self.actualizar_chat(uid, operacion={"estado": "en_curso", "fecha": ahora_iso()})
-            except OSError as exc:
-                await self.avisar(f"❌ No se pudo guardar el estado de {uid}: {exc}. API no llamada.")
-                return
-
-            try:
+                # LLAMADA A LA API DE ACTIVACIÓN (consume los 30 días)
                 await asyncio.to_thread(agregar_dias_api, self.config, uid)
             except ApiNoRegistrado as exc:
-                # La API confirma ausencia de cuenta: no marcar pagado, no apagar
-                # el chat ni crear una activación. El cliente recibe instrucciones.
-                try:
-                    self.actualizar_chat(uid, operacion={
-                        "estado": "no_registrado", "fecha": ahora_iso()
-                    })
-                except OSError:
-                    logger.exception("No se pudo guardar el rechazo por falta de registro de %s", uid)
                 try:
                     await self.enviar_automatico(
                         event, mensaje_registro_pendiente(self.config, uid),
                         forzar=True, responder_a=responder_a,
                     )
                 except Exception:
-                    logger.exception("Fallo aviso de registro al cliente %s", uid)
-                    await self.avisar(f"⚠️ ID {uid} NO registrado; no pude notificarle.")
-                self.registrar_resultado_activacion(
-                    uid, "no_registrado", detalle=str(exc)[:250])
+                    pass
+                self.registrar_resultado_activacion(uid, "no_registrado", detalle=str(exc)[:250])
                 return
             except ApiRechazo as exc:
-                self.actualizar_chat(uid, operacion={"estado": "rechazada", "fecha": ahora_iso()})
-                self.registrar_resultado_activacion(
-                    uid, "rechazada", detalle=str(exc)[:350])
+                self.registrar_resultado_activacion(uid, "rechazada", detalle=str(exc)[:350])
                 try:
                     await self.enviar_automatico(
-                        event,
-                        "❌ LICENCIA NO ACTIVADA\n\n"
-                        "No fue posible completar la activación. Un asesor revisará el problema. "
-                        "No se confirmó la activación de tu cuenta.",
+                        event, "❌ LICENCIA NO ACTIVADA: La API rechazó la solicitud.",
                         forzar=True, responder_a=responder_a,
                     )
                 except Exception:
-                    logger.exception("No se pudo avisar al cliente %s del rechazo", uid)
+                    pass
                 return
             except Exception as exc:
-                logger.warning("Activación incierta %s: %s", uid, exc)
-                self.actualizar_chat(uid, operacion={"estado": "incierta", "fecha": ahora_iso()})
-                self.registrar_resultado_activacion(
-                    uid, "incierta", detalle=(f"{str(exc)[:250]}. "
-                         "Revisar panel antes de /desbloquear y repetir."))
                 try:
                     await self.enviar_automatico(
-                        event,
-                        "⚠️ ACTIVACIÓN PENDIENTE DE VERIFICACIÓN\n\n"
-                        "No pudimos confirmar la respuesta del sistema. "
-                        "Un asesor verificará el estado de tu licencia antes de reintentar.",
+                        event, f"⚠️ Error de conexión con la API: {exc}",
                         forzar=True, responder_a=responder_a,
                     )
                 except Exception:
-                    logger.exception("No se pudo avisar al cliente %s de la respuesta incierta", uid)
+                    pass
                 return
 
             try:
@@ -1375,34 +885,21 @@ class BotBanca:
                     operacion={"estado": "confirmada", "fecha": ahora_iso()},
                     ultima_activacion={"dias": DIAS, "fecha": ahora_iso(), "timestamp": time.time()},
                 )
-            except OSError as exc:
-                # API confirmó; aunque falle el disco, avisamos al cliente.
-                # El registro en memoria conserva en_curso para no activar dos veces.
-                logger.exception("API confirmó pero no pude persistir la activación de %s", uid)
-                await self.avisar(
-                    f"🚨 API ACTIVÓ ID {uid}, pero falló el guardado local: {exc}. "
-                    "NO repitas la activación; revisa el historial."
-                )
-            # Registrar el éxito de licencia sin fabricar una venta bancaria ni
-            # cancelar el pedido VOUCHERS existente.
+            except Exception:
+                pass
+
             try:
                 venta = self.venta_actual(uid)
-                if venta and venta.get("producto") == "banca" and venta.get("estado") != "cancelado":
+                if venta and venta.get("estado") != "cancelado":
                     self.cambiar_estado_venta(
                         venta["id"], "entregado", "Activación de 30 días confirmada por la API"
                     )
                 self.registrar_resultado_activacion(
                     uid, "confirmada", dias=DIAS,
-                    detalle="La API /api/add_days confirmó +30 días de licencia")
+                    detalle="La API confirmó +30 días de licencia")
             except Exception:
-                logger.exception("API confirmó a %s, pero falló el historial local", uid)
-                await self.avisar(
-                    f"⚠️ API confirmó a {uid}, pero falló el registro de ventas. No repetir la activación.",
-                    tema="activaciones")
-            try:
-                self.guardar_estado_cliente(uid, estado="entregado", recordatorio_pendiente=False)
-            except OSError:
-                logger.exception("No se pudo actualizar el estado del cliente %s", uid)
+                pass
+
             try:
                 await self.enviar_automatico(
                     event,
@@ -1413,9 +910,7 @@ class BotBanca:
                     forzar=True, html=True, responder_a=responder_a,
                 )
             except Exception:
-                logger.exception("API activó, pero falló la confirmación a %s", uid)
-                await self.avisar(f"⚠️ ID {uid} activado en API, pero el mensaje al cliente falló.")
-            logger.info("API confirmó %s días para ID %s; registro enviado al grupo", DIAS, uid)
+                pass
 
     async def preparar_qr(self):
         if QR_FILE.is_file() and QR_FILE.stat().st_size > 0:
@@ -1427,103 +922,31 @@ class BotBanca:
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
             with urllib.request.urlopen(req, timeout=15) as res:
                 datos = res.read(6_000_000)
-            if not datos or len(datos) >= 6_000_000:
-                raise ValueError("Imagen del QR vacía o demasiado grande")
             QR_FILE.write_bytes(datos)
         try:
             await asyncio.to_thread(descargar)
-        except Exception as exc:
-            logger.warning("No se pudo descargar el QR: %s", exc)
+        except Exception:
+            pass
 
     async def mandar_qr(self, event):
-        uid = str(event.chat_id)
         if QR_FILE.is_file() and QR_FILE.stat().st_size:
             try:
                 await self.enviar_automatico(event, archivo=QR_FILE)
                 return
-            except FloodWaitError:
-                raise
-            except Exception as exc:
-                logger.warning("No se pudo mandar foto QR a %s: %s", uid, exc)
-        url = self.config.get("qr_url", "")
-        if url:
-            await self.enviar_automatico(event, "📲 QR de pago:\n" + url)
+            except Exception:
+                pass
 
     async def mandar_pago(self, event, uid, *, forzar=False, producto=None, pedido_creditos=None,
                           registrar_pedido=True):
-        estado = self.estado_cliente(uid)
-        producto = producto or estado.get("producto") or "banca"
-        if producto not in PRODUCTOS_COMPRA:
-            producto = "banca"
-        if producto == "creditos" and pedido_creditos is None and estado.get("producto") == "creditos":
-            pedido_creditos = estado.get("pedido_creditos")
-        if (not forzar and estado and estado.get("producto", "banca") == producto
-                and (producto != "creditos" or estado.get("pedido_creditos") == pedido_creditos)
-                and time.time() - float(estado.get("ultimo_pago") or 0) < REPETIR_PAGO_SEGUNDOS):
-            return
-        datos = PRODUCTOS_COMPRA[producto]
-        nombre = datos["nombre"]
-        if producto == "creditos":
-            if pedido_creditos:
-                nombre = f"{pedido_creditos['cantidad']} CRÉDITOS"
-            precio = pedido_creditos.get("importe") if pedido_creditos else None
-            if precio:
-                precio_texto = (
-                    f"💰 Importe indicado en el mensaje: <b>S/ {precio}</b>\n"
-                    "⚠️ <b>Precio sujeto a confirmación por un asesor.</b>\n\n"
-                )
-            else:
-                precio_texto = "💰 Precio: <b>pendiente de cotización</b>\n\n"
-            instrucciones = (
-                "⚠️ <b>Antes de pagar, espera que un asesor confirme el precio.</b>\n"
-                "📸 Si ya pagaste, envía tu comprobante para revisión."
-            )
-        elif datos["precio"] is None:
-            precio_texto = "💰 Precio: <b>por confirmar</b>\n\n"
-            instrucciones = "Un asesor identificará el producto y confirmará el importe."
-        else:
-            precio_texto = f"💰 Precio: <b>S/ {datos['precio']}</b>\n\n"
-            instrucciones = (
-                "✅ Verifica el banco y el titular antes de transferir.\n"
-                "📸 Después del pago, envía una imagen del comprobante. "
-                "Un asesor revisará el pago antes de entregar o activar el producto."
-            )
-        duracion = f"📅 Duración: <b>{datos['duracion']}</b>\n" if datos["duracion"] else ""
         await self.mandar_qr(event)
         texto = (
             "🤖 <b>LOS CHUCKYS — CONFIRMACIÓN DE PEDIDO</b>\n\n"
-            f"📦 Producto: <b>{nombre}</b>\n"
-            f"{duracion}"
-            f"{precio_texto}"
-            "🏦 <b>TRANSFERENCIA BANCARIA</b>\n"
-            "Número de cuenta:\n"
-            f"<code>{self.config['numero_cuenta']}</code>\n\n"
-            f"{instrucciones}"
+            f"🏦 Cuenta: <code>{self.config['numero_cuenta']}</code>\n"
+            "Envía tu comprobante después de transferir."
         )
-        enviado = await self.enviar_automatico(event, texto, html=True)
-        if enviado is not None:
-            emisor = await event.get_sender()
-            nombre_cliente = " ".join(filter(None, [getattr(emisor, "first_name", ""),
-                                                    getattr(emisor, "last_name", "")])).strip()
-            venta = None
-            if registrar_pedido:
-                venta, _ = self.nueva_venta(uid, producto, pedido_creditos, cliente_nombre=nombre_cliente)
-            # Repetir QR/precio nunca degrada el pedido tras recibir comprobante
-            # ni crea un nuevo aviso de 2 minutos por una simple consulta.
-            venta_previa = venta or self.venta_actual(uid)
-            estado_previo = (venta_previa or {}).get("estado") or estado.get("estado")
-            cambios = {"ultimo_pago": time.time()}
-            if registrar_pedido and estado_previo in ("pendiente", None):
-                cambios.update(
-                    venta_id=venta["id"] if venta else estado.get("venta_id"),
-                    estado="pendiente", producto=producto,
-                    pedido_creditos=pedido_creditos if producto == "creditos" else None,
-                    recordatorio_pendiente=producto != "creditos" and not estado.get("recordatorio_enviado", False),
-                    recordatorio_enviado=estado.get("recordatorio_enviado", False),
-                )
-            elif not estado:
-                cambios.update(producto=producto, estado="informacion", recordatorio_pendiente=False)
-            self.guardar_estado_cliente(uid, **cambios)
+        await self.enviar_automatico(event, texto, html=True)
+        if registrar_pedido:
+            self.nueva_venta(uid, producto or "banca", pedido_creditos)
 
     async def respuesta_corta(self, event, texto):
         uid = str(event.chat_id)
@@ -1540,170 +963,28 @@ class BotBanca:
         uid = str(event.sender_id)
         lock = self.locks_entrada.setdefault(uid, asyncio.Lock())
         async with lock:
-            permitir_respuestas = self.esta_on(uid)
+            if not self.esta_on(uid):
+                return
             try:
                 emisor = await event.get_sender()
                 if getattr(emisor, "bot", False):
                     return
                 texto = normalizar(event.raw_text or "")
-                estado = self.estado_cliente(uid)
 
                 if es_imagen(event):
                     venta = self.venta_actual(uid)
-                    vigente = bool(venta and venta.get("estado") in
-                                   ("pendiente", "revision", "pagado"))
-                    posible_pago = bool(re.search(
-                        r"\b(comprobante|pago|pague|transferencia|deposito|voucher de pago)\b",
-                        texto))
-                    en_proceso = estado.get("estado") in ("pendiente", "revision")
-                    if not vigente and not en_proceso and not posible_pago:
-                        if permitir_respuestas:
-                            await self.respuesta_corta(
-                                event, "📸 Recibí tu imagen. Para comprar escribe /bot.")
-                        return
-
-                    if not vigente:
-                        producto = (estado.get("producto") if en_proceso else None) or "otro"
-                        if producto not in PRODUCTOS_COMPRA:
-                            producto = "otro"
-                        nombre_cliente = " ".join(filter(None, [
-                            getattr(emisor, "first_name", ""),
-                            getattr(emisor, "last_name", "")])).strip()
-                        venta, _ = self.nueva_venta(
-                            uid, producto, estado.get("pedido_creditos") if en_proceso else None,
-                            cliente_nombre=nombre_cliente)
-                    if venta.get("estado") in ("pendiente", "revision"):
-                        self.cambiar_estado_venta(
-                            venta["id"], "revision", "Captura recibida; pago sin verificar")
-                    self.guardar_estado_cliente(
-                        uid, estado="revision" if venta.get("estado") != "pagado" else "pagado",
-                        venta_id=venta["id"], recordatorio_pendiente=False)
+                    if not venta:
+                        venta, _ = self.nueva_venta(uid, "banca")
+                    self.cambiar_estado_venta(venta["id"], "revision", "Captura recibida")
                     await self.copiar_comprobante_en_grupo(event, uid)
-                    if permitir_respuestas:
-                        await self.enviar_automatico(
-                            event,
-                            "✅ Recibí tu comprobante. Un asesor revisará el pago. "
-                            "El pago todavía no está confirmado.")
+                    await self.enviar_automatico(event, "✅ Recibí tu comprobante. Un asesor validará tu pago.")
                     return
 
-                if not permitir_respuestas:
+                if quiere_menu(texto) or quiere_comprar(texto):
+                    await self.mandar_pago(event, uid, producto="banca")
                     return
-
-                if texto in ("/qr", "qr", "pagar", "reenviar"):
-                    if time.time() - self.ultimo_qr.get(uid, 0) >= REPETIR_QR_SEGUNDOS:
-                        await self.mandar_pago(event, uid, forzar=True)
-                        self.ultimo_qr[uid] = time.time()
-                    return
-
-                pedido_especial = detectar_pedido_especial(texto)
-                if pedido_especial:
-                    producto, pedido_creditos = pedido_especial
-                    await self.mandar_pago(event, uid, producto=producto, pedido_creditos=pedido_creditos)
-                    return
-
-                if quiere_menu(texto):
-                    # Cada consulta explícita de precio envía QR + importe nuevamente,
-                    # aunque el usuario reenvíe el mismo texto varios minutos después.
-                    if quiere_precio(texto):
-                        producto = "vouchers" if re.search(r"\bvouchers?\b", texto) else "banca"
-                        await self.mandar_pago(event, uid, producto=producto)
-                    else:
-                        await self.enviar_automatico(
-                            event,
-                            "🤖 LOS CHUCKYS — PRECIOS\n\n"
-                            "📦 BOT DE BANCA: 30 días — S/ 5\n"
-                            "🎟️ VOUCHERS: 30 días — S/ 5\n"
-                            "🪙 CRÉDITOS — importe a confirmar con asesor\n\n"
-                            "Para recibir QR + precio, escribe: precio del bot o precio vouchers."
-                        )
-                    return
-
-                if quiere_comprar(texto):
-                    producto = "vouchers" if re.search(r"\bvouchers?\b", texto) else "banca"
-                    await self.mandar_pago(event, uid, producto=producto)
-                    return
-
-                if estado.get("estado") == "revision":
-                    await self.respuesta_corta(event, "✅ Tu comprobante sigue en revisión por un asesor.")
-                    return
-                if estado.get("estado") == "pendiente":
-                    # No repetir QR ni molestar con cada saludo o mensaje casual.
-                    return
-                if estado.get("estado") in ("entregado", "pagado"):
-                    return
-                await self.respuesta_corta(
-                    event, "👋 ¡Hola! Soy el asistente de Los Chuckys. "
-                           "Escribe /bot para ver los planes o «precio del bot» para recibir el QR."
-                )
-            except FloodWaitError as exc:
-                logger.warning("Telegram pidió esperar %s segundos", exc.seconds)
-                await asyncio.sleep(min(int(exc.seconds), 3600))
             except Exception:
-                logger.exception("No se pudo responder al chat %s", uid)
-
-    async def enviar_recordatorio(self, uid):
-        uid = str(uid)
-        if not self.esta_on(uid):
-            return
-        self.enviando[uid] = self.enviando.get(uid, 0) + 1
-        try:
-            mensaje = await self.client.send_message(
-                int(uid),
-                "⏰ Han pasado 2 minutos desde que te envié el QR de pago.\n\n"
-                "📸 Si ya realizaste el pago, envía la captura del comprobante "
-                "para que un asesor pueda revisarlo.\n\n"
-                "Si decidiste no comprar, no necesitas responder. Gracias."
-            )
-            self.recordar_envio(uid, mensaje)
-        finally:
-            restantes = self.enviando[uid] - 1
-            if restantes:
-                self.enviando[uid] = restantes
-            else:
-                self.enviando.pop(uid, None)
-
-    async def revisar_recordatorios(self):
-        while True:
-            try:
-                for uid in list(self.estados):
-                    if not self.esta_on(uid):
-                        continue
-                    estado = self.estado_cliente(uid)
-                    if (estado.get("estado") != "pendiente"
-                            or not estado.get("recordatorio_pendiente")
-                            or estado.get("recordatorio_enviado")):
-                        continue
-                    try:
-                        transcurrido = time.time() - float(estado.get("ultimo_pago", 0))
-                    except (TypeError, ValueError):
-                        continue
-                    if transcurrido < ESPERA_COMPROBANTE_SEGUNDOS:
-                        continue
-                    if transcurrido > 24 * 60 * 60:
-                        self.guardar_estado_cliente(uid, recordatorio_pendiente=False)
-                        continue
-                    lock = self.locks_entrada.setdefault(uid, asyncio.Lock())
-                    async with lock:
-                        estado = self.estado_cliente(uid)
-                        if (not self.esta_on(uid) or estado.get("estado") != "pendiente"
-                                or not estado.get("recordatorio_pendiente")
-                                or estado.get("recordatorio_enviado")):
-                            continue
-                        self.guardar_estado_cliente(
-                            uid, recordatorio_pendiente=False,
-                            recordatorio_enviado=True,
-                            fecha_recordatorio=ahora_iso(),
-                        )
-                        try:
-                            await self.enviar_recordatorio(uid)
-                            logger.info("Recordatorio único después de 2 minutos para %s", uid)
-                        except Exception:
-                            logger.exception("No fue posible enviar el recordatorio a %s", uid)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("Error revisando recordatorios")
-            await asyncio.sleep(INTERVALO_REVISION_SEGUNDOS)
+                pass
 
     async def iniciar(self, *, login=False):
         if login:
@@ -1721,34 +1002,20 @@ class BotBanca:
                     return
                 cuenta = await self.client.get_me()
                 self.mi_id = cuenta.id
-                logger.info("BOT BANCA activo con %s | S/ 5, licencia 30 días | AVISOS AL GRUPO", cuenta.first_name)
-                self.tarea_recordatorios = asyncio.create_task(self.revisar_recordatorios())
+                logger.info("BOT ACTIVO para %s", cuenta.first_name)
                 self.tarea_grupo = asyncio.create_task(self.loop_registro_ventas())
                 await self.client.run_until_disconnected()
-                logger.warning("Telegram desconectado; reconectando")
             except (asyncio.CancelledError, KeyboardInterrupt):
                 raise
             except Exception:
-                logger.exception("Error de conexión (se reintentará)")
+                pass
             finally:
                 if self.tarea_grupo is not None:
                     self.tarea_grupo.cancel()
-                    try:
-                        await self.tarea_grupo
-                    except asyncio.CancelledError:
-                        pass
-                    self.tarea_grupo = None
-                if self.tarea_recordatorios is not None:
-                    self.tarea_recordatorios.cancel()
-                    try:
-                        await self.tarea_recordatorios
-                    except asyncio.CancelledError:
-                        pass
-                    self.tarea_recordatorios = None
                 try:
                     await self.client.disconnect()
                 except Exception:
-                    logger.exception("No se pudo cerrar conexión")
+                    pass
             await asyncio.sleep(RECONEXION_SEGUNDOS)
 
 
@@ -1763,8 +1030,7 @@ if __name__ == "__main__":
     try:
         asyncio.run(principal())
     except KeyboardInterrupt:
-        logger.info("Programa detenido manualmente")
+        logger.info("Detenido")
     except Exception as exc:
-        logger.exception("No se pudo iniciar: %s", exc)
         print(f"ERROR: {exc}")
         raise SystemExit(1)
