@@ -75,9 +75,10 @@ PRODUCTOS_COMPRA = {
 }
 ESTADO_VIGENCIA = 7 * 24 * 60 * 60
 ESPERA_COMPROBANTE_SEGUNDOS = 2 * 60
-REPETIR_PAGO_SEGUNDOS = 7 * 60
-REPETIR_RESPUESTA_SEGUNDOS = 7 * 60
-REPETIR_QR_SEGUNDOS = 60
+# Solo evita ráfagas inmediatas. Una nueva consulta después puede recibir el QR.
+REPETIR_PAGO_SEGUNDOS = 3
+REPETIR_RESPUESTA_SEGUNDOS = 8
+REPETIR_QR_SEGUNDOS = 3
 INTERVALO_REVISION_SEGUNDOS = 5
 COOLDOWN_ACTIVACION = 90
 RECONEXION_SEGUNDOS = 10
@@ -88,6 +89,9 @@ CONFIG_POR_DEFECTO = {
     "qr_url": "https://i.postimg.cc/sfccGwZ0/image.png",
     "numero_cuenta": "09400141002543052450",
     "api_activar_url": "https://activaciones.vercel.app/api/add_days",
+    # Bot de registro del cliente para usuarios que no existen en la API.
+    # Se acepta @Usuario o https://t.me/Usuario.
+    "bot_registro_username": "@YapeXCenter_bot",
     "token_activacion": "",
     "timeout_api_segundos": 15,
     "grupo_ventas_id": -1004489972169,
@@ -158,6 +162,8 @@ def leer_configuracion(*, permitir_preguntar=False):
         config["api_hash"] = os.environ["TELEGRAM_API_HASH"]
     if os.getenv("ACTIVACIONES_TOKEN"):
         config["token_activacion"] = os.environ["ACTIVACIONES_TOKEN"]
+    if os.getenv("BOT_REGISTRO_USERNAME"):
+        config["bot_registro_username"] = os.environ["BOT_REGISTRO_USERNAME"]
 
     try:
         config["api_id"] = int(config["api_id"])
@@ -233,22 +239,47 @@ def detectar_pedido_especial(texto):
 
 
 def quiere_comprar(texto):
+    """Evita interpretar un número o una conversación normal como compra."""
     t = normalizar(texto)
-    return bool(
-        t == "1"
-        or re.search(r"\b(bot\s+(?:de\s+)?(?:banca|bancario|yape))\b", t)
-        or re.search(r"\b(30\s*dias|un\s+mes|1\s*mes)\b", t)
-        or re.search(r"\bs\s*/\s*5\b|\b5\s*soles?\b", t)
-    )
+    if t == "1":
+        return True
+    producto = bool(re.search(r"\b(bot\s+(?:de\s+)?(?:banca|bancario|yape)|licencia|vouchers?)\b", t))
+    intencion = bool(re.search(r"\b(quiero|comprar|adquirir|necesito|deseo|contratar|pagar|pedido|activar)\b", t))
+    return producto and intencion
 
 
 def quiere_menu(texto):
     t = normalizar(texto)
     return bool(
         re.search(r"(^|\s)(/bot|/banca|/start|plan|planes|precio|precios|tarifa|tarifas|menu)(\s|$)", t)
-        or "cuanto cuesta" in t
-        or "que precio" in t
+        or any(p in t for p in ("cuanto cuesta", "que precio", "cuanto vale", "cuanto sale"))
     )
+
+
+def quiere_precio(texto):
+    t = normalizar(texto)
+    return bool(re.search(r"\b(precio|precios|cuesta|vale|coste|costo|costaria|tarifa|tarifas)\b", t)
+                or "cuanto sale" in t)
+
+
+# Activa SOLO por una orden deliberada. Una frase conversacional sobre activación
+# no debe sumar días por accidente. Se admiten acentos, /activate y respuestas.
+ORDEN_ACTIVAR = re.compile(
+    r"^(?:/(?:activate|activar)|activate|activar|activa|activate|activate licencia|"
+    r"activate la licencia|activa licencia|activa la licencia|activar licencia|"
+    r"activar la licencia|activale|activale licencia|activate ya|activa ya|"
+    r"activa 30 dias|activar 30 dias)"
+    r"(?:\s+(?:30|30 dias|por 30 dias))?[.!]?$"
+)
+
+
+def es_orden_activar(texto):
+    return bool(ORDEN_ACTIVAR.fullmatch(normalizar(texto)))
+
+
+def parece_orden_activar(texto):
+    return bool(re.match(r"^(?:/(?:activate|activar)\b|(?:activar|activa|activate|activale)\b)",
+                         normalizar(texto)))
 
 
 def es_imagen(event):
@@ -263,8 +294,67 @@ class ApiRechazo(Exception):
     pass
 
 
+class ApiNoRegistrado(ApiRechazo):
+    """La API confirmó que el cliente no tiene cuenta de Telegram registrada."""
+
+
 class ApiIncierta(Exception):
     pass
+
+
+def es_cliente_no_registrado(respuesta):
+    """Reconoce respuestas conocidas de usuario inexistente sin confundir fallos de red.
+
+    Se revisa el contenido y no el HTTP 404 por sí solo: un 404 también puede
+    indicar que el endpoint de la API ha cambiado o no existe.
+    """
+    if isinstance(respuesta, dict):
+        indicadores = ("registered", "registrado", "isRegistered", "is_registered",
+                       "userExists", "user_exists", "accountExists", "account_exists")
+        if any(respuesta.get(k) is False for k in indicadores):
+            return True
+        campos = ("error", "message", "mensaje", "detail", "details",
+                  "description", "code", "status", "reason", "data", "user", "usuario", "account", "result")
+        return any(es_cliente_no_registrado(respuesta[k]) for k in campos
+                   if k in respuesta and respuesta[k] is not None)
+    if isinstance(respuesta, (tuple, list)):
+        return any(es_cliente_no_registrado(item) for item in respuesta[:8])
+    if not isinstance(respuesta, str):
+        return False
+    texto = normalizar(respuesta).replace("_", " ").replace("-", " ")
+    if not texto or texto.lstrip().startswith("<"):
+        return False
+    frases = (
+        r"\b(?:usuario|user|cliente|client|cuenta|account)\b.{0,75}\b(?:no existe|no encontrado|no encontrada|no registrado|no registrada|no esta registrado|no esta registrada|no se encuentra|not found|not registered|does not exist|inexistente|sin registrar)\b",
+        r"\b(?:no existe|no se encontro|no encontramos|no se encuentra|no esta registrado|no user found|sin registro|not found)\b.{0,45}\b(?:usuario|user|cuenta|account|cliente|client|telegram)\b",
+        r"\b(?:telegram\s*(?:id)?|telegramid)\b.{0,55}\b(?:no registrado|no esta registrado|no encontrado|no se encuentra|not found|not registered|no existe)\b",
+        r"\b(?:user not found|user not registered|account not found|usuario no registrado|usuario no encontrado|registro requerido|registration required|register first|registrate primero|debes registrarte)\b",
+    )
+    return any(re.search(patron, texto) for patron in frases)
+
+
+def obtener_usuario_bot_registro(config):
+    """Valida el bot proporcionado, sin construir enlaces no configurados."""
+    dato = str(config.get("bot_registro_username") or "").strip()
+    dato = re.sub(r"^(?:https?://)?(?:t\.me|telegram\.me)/", "", dato, flags=re.I)
+    dato = dato.strip("@/ ").split("?", 1)[0]
+    return dato if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{4,31}", dato) else ""
+
+
+def mensaje_registro_pendiente(config, uid):
+    usuario_bot = obtener_usuario_bot_registro(config)
+    instruccion = (f"🤖 Regístrate en: https://t.me/{usuario_bot}\n"
+                   if usuario_bot else
+                   "🤖 Pide al asesor el enlace del bot de registro.\n")
+    return (
+        "❌ LICENCIA NO ACTIVADA\n\n"
+        "🔎 Tu cuenta de Telegram no aparece registrada en el sistema de licencias.\n"
+        f"🆔 Tu ID de Telegram: {uid}\n\n"
+        "📝 Para activar tu licencia primero necesitas crear tu cuenta.\n"
+        f"{instruccion}\n"
+        "✅ Cuando termines de registrarte, avisa al asesor para que vuelva a intentar la activación.\n\n"
+        "⚠️ No se agregaron días a tu licencia."
+    )
 
 
 def agregar_dias_api(config, uid):
@@ -280,30 +370,48 @@ def agregar_dias_api(config, uid):
             tipo = res.headers.get("Content-Type", "").lower()
             cuerpo = res.read(32768).decode("utf-8", errors="replace").strip()
     except urllib.error.HTTPError as exc:
-        detalle = exc.read(512).decode("utf-8", errors="replace").strip()
+        detalle = exc.read(4096).decode("utf-8", errors="replace").strip()
+        try:
+            contenido_error = json.loads(detalle)
+        except ValueError:
+            contenido_error = detalle
+        if es_cliente_no_registrado(contenido_error):
+            raise ApiNoRegistrado(f"HTTP {exc.code}: {detalle[:350]}") from exc
         if 400 <= exc.code < 500:
-            raise ApiRechazo(f"HTTP {exc.code}: {detalle[:180]}") from exc
-        raise ApiIncierta(f"HTTP {exc.code}: {detalle[:180]}") from exc
+            raise ApiRechazo(f"HTTP {exc.code}: {detalle[:350]}") from exc
+        raise ApiIncierta(f"HTTP {exc.code}: {detalle[:350]}") from exc
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         raise ApiIncierta(str(exc)) from exc
 
     if "text/html" in tipo or cuerpo.lower().startswith("<!doctype html"):
         raise ApiIncierta("El endpoint devolvió HTML en lugar de una respuesta de API")
-    if cuerpo:
-        try:
-            respuesta = json.loads(cuerpo)
-        except ValueError:
-            if cuerpo.lower() not in ("ok", "success", "true"):
-                raise ApiIncierta("Respuesta de la API no reconocida")
-        else:
-            if isinstance(respuesta, dict):
-                if respuesta.get("success") is False or respuesta.get("ok") is False:
-                    raise ApiRechazo(str(respuesta.get("message") or "La API rechazó la operación"))
-                if respuesta.get("error"):
-                    raise ApiRechazo(str(respuesta["error"]))
-            elif respuesta is False:
-                raise ApiRechazo("La API devolvió false")
-    return True
+    # No se confirma una licencia con una respuesta vacía o ambigua.
+    if not cuerpo:
+        raise ApiIncierta("La API no devolvió confirmación verificable")
+    try:
+        respuesta = json.loads(cuerpo)
+    except ValueError:
+        if cuerpo.lower() in ("ok", "success", "true"):
+            return True
+        if es_cliente_no_registrado(cuerpo):
+            raise ApiNoRegistrado(cuerpo[:350])
+        raise ApiIncierta("Respuesta no reconocida de la API")
+    if respuesta is True:
+        return True
+    if respuesta is False:
+        raise ApiRechazo("La API devolvió false")
+    if not isinstance(respuesta, dict):
+        raise ApiIncierta("La API no devolvió un resultado válido")
+    if es_cliente_no_registrado(respuesta):
+        raise ApiNoRegistrado(str(respuesta.get("error") or respuesta.get("message")
+                                  or "El usuario de Telegram no está registrado")[:350])
+    if respuesta.get("success") is False or respuesta.get("ok") is False or respuesta.get("error"):
+        raise ApiRechazo(str(respuesta.get("error") or respuesta.get("message") or "La API rechazó la operación")[:350])
+    estado = str(respuesta.get("status", "")).lower()
+    if (respuesta.get("success") is True or respuesta.get("ok") is True
+            or estado in ("ok", "success", "completed", "activated")):
+        return True
+    raise ApiIncierta("La API respondió sin success:true, ok:true o status de éxito")
 
 
 class BotBanca:
@@ -324,6 +432,7 @@ class BotBanca:
         self.historial_propios = deque(maxlen=4000)
         self.ultima_respuesta = {}
         self.ultimo_qr = {}
+        self.ventas_pendientes_evento = asyncio.Event()
         self.tarea_recordatorios = None
         self.tarea_grupo = None
         self.grupo_ventas = None
@@ -392,6 +501,7 @@ class BotBanca:
 
     def guardar_ventas(self):
         escribir_json_atomico(VENTAS_FILE, self.ventas)
+        self.ventas_pendientes_evento.set()
 
     def venta_actual(self, uid):
         claves = [v for v in self.ventas["pedidos"].values()
@@ -487,12 +597,18 @@ class BotBanca:
         if gid:
             try:
                 self.grupo_ventas = await self.client.get_entity(int(gid))
-            except (ValueError, TypeError) as exc:
-                raise RuntimeError(
-                    f"No puedo encontrar el grupo de ventas {gid}. "
-                    "Comprueba que tu cuenta de Telegram esté dentro del grupo, "
-                    "ábrelo desde Telegram y reinicia el programa."
-                ) from exc
+            except (ValueError, TypeError):
+                # Telethon no siempre conoce el access_hash del grupo por su ID.
+                # Carga los diálogos en la tarea de ventas, sin bloquear privados.
+                try:
+                    await self.client.get_dialogs(limit=None)
+                    self.grupo_ventas = await self.client.get_entity(int(gid))
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"No puedo abrir el grupo de ventas {gid}. "
+                        "Comprueba que la cuenta de Telegram pertenece al grupo "
+                        "y que sus temas están activados."
+                    ) from exc
             self.grupo_ventas_id = utils.get_peer_id(self.grupo_ventas)
         elif self.config.get("crear_grupo_ventas_si_falta", True):
             resultado = await self.client(CreateChannelRequest(
@@ -618,7 +734,7 @@ class BotBanca:
                          "mensaje_id": mensaje_id, "pedido": venta["id"],
                          "fecha": ahora_iso()})
             self.guardar_ventas()
-        await self.drenar_comprobantes()
+        # El registro se vacía en loop_registro_ventas, no bloquea el mensaje al cliente.
 
     async def drenar_comprobantes(self):
         tema = self.temas_ids.get("pagos")
@@ -673,17 +789,32 @@ class BotBanca:
         await self.drenar_comprobantes()
 
     async def loop_registro_ventas(self):
+        # Nunca detiene la atención de mensajes privados por un grupo sin permisos.
+        fallos = 0
         while True:
             try:
                 await self.conectar_registro_ventas()
+                fallos = 0
             except asyncio.CancelledError:
                 raise
             except FloodWaitError as exc:
-                logger.warning("Límite de Telegram para grupo: %s s", exc.seconds)
+                logger.warning("Límite temporal de Telegram en grupo: %s s", exc.seconds)
                 await asyncio.sleep(min(3600, int(exc.seconds)))
-            except Exception:
-                logger.exception("Error de registro de ventas")
-            await asyncio.sleep(45)
+            except Exception as exc:
+                fallos += 1
+                if fallos == 1 or fallos % 20 == 0:
+                    logger.exception("Registro de ventas no disponible; los privados siguen activos: %s", exc)
+            # Se drena pronto si hubo ventas y el grupo está operativo.
+            # Con fallos se espera para no insistir contra Telegram cada instante.
+            if fallos:
+                self.ventas_pendientes_evento.clear()
+                await asyncio.sleep(45)
+            else:
+                self.ventas_pendientes_evento.clear()
+                try:
+                    await asyncio.wait_for(self.ventas_pendientes_evento.wait(), timeout=45)
+                except asyncio.TimeoutError:
+                    pass
 
     async def comando_grupo_ventas(self, event):
         if not self.mi_id or not self.grupo_ventas_id:
@@ -753,7 +884,8 @@ class BotBanca:
             self.historial_propios.append(clave)
             self.mensajes_propios.add(clave)
 
-    async def enviar_automatico(self, event, texto=None, *, archivo=None, forzar=False, html=False):
+    async def enviar_automatico(self, event, texto=None, *, archivo=None, forzar=False,
+                                html=False, responder_a=None):
         uid = str(event.chat_id)
         if not forzar and not self.esta_on(uid):
             return None
@@ -762,6 +894,8 @@ class BotBanca:
             kwargs = {"file": str(archivo)} if archivo else {}
             if html:
                 kwargs["parse_mode"] = "html"
+            if responder_a is not None:
+                kwargs["reply_to"] = responder_a
             resultado = await event.respond(texto, **kwargs) if texto is not None else await event.respond(**kwargs)
             self.recordar_envio(uid, resultado)
             return resultado
@@ -784,9 +918,13 @@ class BotBanca:
         uid = str(event.chat_id)
         if self.mi_id and uid == str(self.mi_id):
             return
-        if self.enviando.get(uid, 0) or (uid, event.id) in self.mensajes_propios:
-            return
         texto = normalizar(event.raw_text or "")
+        if (uid, event.id) in self.mensajes_propios:
+            return
+        # Dar prioridad a una orden humana de activación aunque coincida con
+        # el envío de un mensaje del bot al mismo cliente.
+        if self.enviando.get(uid, 0) and not parece_orden_activar(texto):
+            return
 
         if texto in ("/on", "/off", "/estado", "/status", "/ayuda", "/help"):
             await self.eliminar_comando(event)
@@ -827,13 +965,26 @@ class BotBanca:
                 await self.avisar(f"ID {uid} no tiene activación incierta.")
             return
 
-        if texto == "/activate" or texto == "/activate 30":
+        if es_orden_activar(texto):
+            # En respuesta, valida que el mensaje citado pertenezca al cliente;
+            # nunca activamos al autor equivocado o al responder al propio bot.
+            respuesta_id = getattr(event.message, "reply_to_msg_id", None)
+            if respuesta_id is not None:
+                try:
+                    citado = await event.get_reply_message()
+                except Exception:
+                    logger.exception("No se pudo verificar la respuesta citada en %s", uid)
+                    await self.avisar(f"⚠️ No se activó a {uid}: no pude verificar el mensaje respondido.")
+                    return
+                if citado is None or int(getattr(citado, "sender_id", 0) or 0) != int(uid):
+                    await self.avisar(f"⚠️ No se activó a {uid}: responde al mensaje ORIGINAL del cliente.")
+                    return
             await self.eliminar_comando(event)
-            await self.activar_cliente(event, uid)
+            await self.activar_cliente(event, uid, responder_a=respuesta_id)
             return
-        if texto.startswith("/activate"):
+        if parece_orden_activar(texto):
             await self.eliminar_comando(event)
-            await self.avisar("⚠️ Solo se permite /activate (30 días). No se sumaron días.")
+            await self.avisar("⚠️ Para activar usa: actívate, activar, /activate o /activate 30. Solo 30 días.")
             return
 
         if texto in ("/entregado", "/vendido", "/voucher", "/entregavoucher"):
@@ -847,7 +998,6 @@ class BotBanca:
                 self.cambiar_estado_venta(venta["id"], "entregado", "Producto entregado manualmente en el chat privado")
                 self.guardar_estado_cliente(uid, estado="entregado", recordatorio_pendiente=False)
                 self.actualizar_chat(uid, activo=False, motivo="entrega_manual")
-                await self.drenar_notificaciones()
                 await self.avisar(f"✅ Entrega anotada para {venta['id']} (cliente {uid}).")
             return
 
@@ -858,17 +1008,17 @@ class BotBanca:
                 estado_efectivo = "entregado" if venta["estado"] == "entregado" else "pagado"
                 self.cambiar_estado_venta(venta["id"], estado_efectivo, "Pago confirmado manualmente por el propietario",
                                           pago_confirmado=True, precio_confirmado=True)
-                await self.drenar_notificaciones()
                 await self.avisar(f"✅ Pago de {venta['id']} confirmado manualmente.")
             else:
                 await self.avisar("⚠️ Este cliente no tiene pedido vigente.")
             return
 
-        self.actualizar_chat(uid, activo=False, motivo="respuesta_manual")
+        # Una respuesta humana ya NO apaga el bot indefinidamente.
+        # Solo /off y la activación confirmada lo dejan inactivo.
         if self.estado_cliente(uid).get("recordatorio_pendiente"):
             self.guardar_estado_cliente(uid, recordatorio_pendiente=False)
 
-    async def activar_cliente(self, event, uid):
+    async def activar_cliente(self, event, uid, *, responder_a=None):
         lock = self.locks_activacion.setdefault(uid, asyncio.Lock())
         async with lock:
             producto = self.estado_cliente(uid).get("producto", "banca")
@@ -888,7 +1038,11 @@ class BotBanca:
                 )
                 return
             ultima = datos.get("ultima_activacion", {})
-            if isinstance(ultima, dict) and time.time() - float(ultima.get("timestamp", 0)) < COOLDOWN_ACTIVACION:
+            try:
+                marca_ultima = float(ultima.get("timestamp", 0)) if isinstance(ultima, dict) else 0
+            except (TypeError, ValueError):
+                marca_ultima = 0
+            if time.time() - marca_ultima < COOLDOWN_ACTIVACION:
                 await self.avisar(f"⚠️ ID {uid}: activación reciente. No se sumaron días otra vez.")
                 return
 
@@ -900,9 +1054,38 @@ class BotBanca:
 
             try:
                 await asyncio.to_thread(agregar_dias_api, self.config, uid)
+            except ApiNoRegistrado as exc:
+                # La API confirma ausencia de cuenta: no marcar pagado, no apagar
+                # el chat ni crear una activación. El cliente recibe instrucciones.
+                try:
+                    self.actualizar_chat(uid, operacion={
+                        "estado": "no_registrado", "fecha": ahora_iso()
+                    })
+                except OSError:
+                    logger.exception("No se pudo guardar el rechazo por falta de registro de %s", uid)
+                try:
+                    await self.enviar_automatico(
+                        event, mensaje_registro_pendiente(self.config, uid),
+                        forzar=True, responder_a=responder_a,
+                    )
+                except Exception:
+                    logger.exception("Fallo aviso de registro al cliente %s", uid)
+                    await self.avisar(f"⚠️ ID {uid} NO registrado; no pude notificarle.")
+                await self.avisar(f"❌ ID {uid}: LICENCIA NO ACTIVADA. Usuario sin registro en la API. {str(exc)[:250]}")
+                return
             except ApiRechazo as exc:
                 self.actualizar_chat(uid, operacion={"estado": "rechazada", "fecha": ahora_iso()})
                 await self.avisar(f"❌ La API rechazó activar ID {uid}: {str(exc)[:350]}")
+                try:
+                    await self.enviar_automatico(
+                        event,
+                        "❌ LICENCIA NO ACTIVADA\n\n"
+                        "No fue posible completar la activación. Un asesor revisará el problema. "
+                        "No se confirmó la activación de tu cuenta.",
+                        forzar=True, responder_a=responder_a,
+                    )
+                except Exception:
+                    logger.exception("No se pudo avisar al cliente %s del rechazo", uid)
                 return
             except Exception as exc:
                 logger.warning("Activación incierta %s: %s", uid, exc)
@@ -912,39 +1095,67 @@ class BotBanca:
                     "Revisa el panel de activaciones antes de reintentar. "
                     "Si confirmas que NO se agregó, usa /desbloquear y luego /activate."
                 )
+                try:
+                    await self.enviar_automatico(
+                        event,
+                        "⚠️ ACTIVACIÓN PENDIENTE DE VERIFICACIÓN\n\n"
+                        "No pudimos confirmar la respuesta del sistema. "
+                        "Un asesor verificará el estado de tu licencia antes de reintentar.",
+                        forzar=True, responder_a=responder_a,
+                    )
+                except Exception:
+                    logger.exception("No se pudo avisar al cliente %s de la respuesta incierta", uid)
                 return
 
-            self.actualizar_chat(
-                uid,
-                activo=False,
-                motivo="activado_30_dias",
-                operacion={"estado": "confirmada", "fecha": ahora_iso()},
-                ultima_activacion={"dias": DIAS, "fecha": ahora_iso(), "timestamp": time.time()},
-            )
-            venta = self.venta_actual(uid)
-            if venta and venta.get("producto") == "banca" and venta.get("estado") != "cancelado":
-                self.cambiar_estado_venta(
-                    venta["id"], "entregado", "Activación de 30 días confirmada por la API"
+            try:
+                self.actualizar_chat(
+                    uid,
+                    activo=False,
+                    motivo="activado_30_dias",
+                    operacion={"estado": "confirmada", "fecha": ahora_iso()},
+                    ultima_activacion={"dias": DIAS, "fecha": ahora_iso(), "timestamp": time.time()},
                 )
-            else:
-                venta, _ = self.nueva_venta(uid, "banca", cliente_nombre="Cliente activado manualmente")
-                self.cambiar_estado_venta(
-                    venta["id"], "entregado", "Activación directa de 30 días confirmada por API"
+            except OSError as exc:
+                # API confirmó; aunque falle el disco, avisamos al cliente.
+                # El registro en memoria conserva en_curso para no activar dos veces.
+                logger.exception("API confirmó pero no pude persistir la activación de %s", uid)
+                await self.avisar(
+                    f"🚨 API ACTIVÓ ID {uid}, pero falló el guardado local: {exc}. "
+                    "NO repitas la activación; revisa el historial."
                 )
-            self.guardar_estado_cliente(uid, estado="entregado", recordatorio_pendiente=False)
-            await self.drenar_notificaciones()
-            await self.avisar(f"✅ API confirmó 30 días para ID {uid}. Chat OFF.")
+            # Un error del grupo o del archivo de ventas no debe impedir avisar
+            # al comprador: la API ya completó la activación.
+            try:
+                venta = self.venta_actual(uid)
+                if venta and venta.get("producto") == "banca" and venta.get("estado") != "cancelado":
+                    self.cambiar_estado_venta(
+                        venta["id"], "entregado", "Activación de 30 días confirmada por la API"
+                    )
+                else:
+                    venta, _ = self.nueva_venta(uid, "banca", cliente_nombre="Cliente activado manualmente")
+                    self.cambiar_estado_venta(
+                        venta["id"], "entregado", "Activación directa de 30 días confirmada por API"
+                    )
+            except Exception:
+                logger.exception("API confirmó a %s, pero no se pudo registrar la venta", uid)
+                await self.avisar(f"⚠️ ID {uid} activado, pero falló el historial de ventas; revisar registro.")
+            try:
+                self.guardar_estado_cliente(uid, estado="entregado", recordatorio_pendiente=False)
+            except OSError:
+                logger.exception("No se pudo actualizar el estado del cliente %s", uid)
             try:
                 await self.enviar_automatico(
                     event,
-                    "✅ <b>BOT DE BANCA ACTIVADO</b>\n\n"
-                    "📅 Se agregaron <b>30 días</b> a tu cuenta.\n"
-                    "💜 Gracias por tu compra.",
-                    forzar=True, html=True,
+                    "✅ <b>LICENCIA ACTIVADA CORRECTAMENTE</b>\n\n"
+                    f"📅 Tiempo activado: <b>{DIAS} días</b>\n"
+                    "🟢 Estado: <b>ACTIVA</b>\n"
+                    "💜 Gracias por tu compra. — Los Chuckys",
+                    forzar=True, html=True, responder_a=responder_a,
                 )
             except Exception:
                 logger.exception("API activó, pero falló la confirmación a %s", uid)
                 await self.avisar(f"⚠️ ID {uid} activado en API, pero el mensaje al cliente falló.")
+            await self.avisar(f"✅ API confirmó {DIAS} días para ID {uid}. Chat OFF.")
 
     async def preparar_qr(self):
         if QR_FILE.is_file() and QR_FILE.stat().st_size > 0:
@@ -988,7 +1199,7 @@ class BotBanca:
             pedido_creditos = estado.get("pedido_creditos")
         if (not forzar and estado and estado.get("producto", "banca") == producto
                 and (producto != "creditos" or estado.get("pedido_creditos") == pedido_creditos)
-                and time.time() - estado.get("ultimo_pago", 0) < REPETIR_PAGO_SEGUNDOS):
+                and time.time() - float(estado.get("ultimo_pago") or 0) < REPETIR_PAGO_SEGUNDOS):
             return
         datos = PRODUCTOS_COMPRA[producto]
         nombre = datos["nombre"]
@@ -1037,13 +1248,22 @@ class BotBanca:
             venta = None
             if registrar_pedido:
                 venta, _ = self.nueva_venta(uid, producto, pedido_creditos, cliente_nombre=nombre_cliente)
-            self.guardar_estado_cliente(
-                uid, venta_id=venta["id"] if venta else None, estado="pendiente", producto=producto,
-                pedido_creditos=pedido_creditos if producto == "creditos" else None,
-                ultimo_pago=time.time(),
-                recordatorio_pendiente=producto != "creditos", recordatorio_enviado=False,
-            )
-            await self.drenar_notificaciones()
+            # Repetir QR/precio nunca degrada el pedido tras recibir comprobante
+            # ni crea un nuevo aviso de 2 minutos por una simple consulta.
+            venta_previa = venta or self.venta_actual(uid)
+            estado_previo = (venta_previa or {}).get("estado") or estado.get("estado")
+            cambios = {"ultimo_pago": time.time()}
+            if registrar_pedido and estado_previo in ("pendiente", None):
+                cambios.update(
+                    venta_id=venta["id"] if venta else estado.get("venta_id"),
+                    estado="pendiente", producto=producto,
+                    pedido_creditos=pedido_creditos if producto == "creditos" else None,
+                    recordatorio_pendiente=producto != "creditos" and not estado.get("recordatorio_enviado", False),
+                    recordatorio_enviado=estado.get("recordatorio_enviado", False),
+                )
+            elif not estado:
+                cambios.update(producto=producto, estado="informacion", recordatorio_pendiente=False)
+            self.guardar_estado_cliente(uid, **cambios)
 
     async def respuesta_corta(self, event, texto):
         uid = str(event.chat_id)
@@ -1098,7 +1318,6 @@ class BotBanca:
                     self.guardar_estado_cliente(
                         uid, estado="revision" if venta.get("estado") != "pagado" else "pagado",
                         venta_id=venta["id"], recordatorio_pendiente=False)
-                    await self.drenar_notificaciones()
                     await self.copiar_comprobante_en_grupo(event, uid)
                     if permitir_respuestas:
                         await self.enviar_automatico(
@@ -1111,10 +1330,9 @@ class BotBanca:
                     return
 
                 if texto in ("/qr", "qr", "pagar", "reenviar"):
-                    ahora = time.time()
-                    if ahora - self.ultimo_qr.get(uid, 0) >= REPETIR_QR_SEGUNDOS:
-                        self.ultimo_qr[uid] = ahora
+                    if time.time() - self.ultimo_qr.get(uid, 0) >= REPETIR_QR_SEGUNDOS:
                         await self.mandar_pago(event, uid, forzar=True)
+                        self.ultimo_qr[uid] = time.time()
                     return
 
                 pedido_especial = detectar_pedido_especial(texto)
@@ -1124,29 +1342,39 @@ class BotBanca:
                     return
 
                 if quiere_menu(texto):
-                    await self.respuesta_corta(
-                        event,
-                        "🤖 LOS CHUCKYS — PRECIOS\n\n"
-                        "📦 BOT DE BANCA: 30 días — S/ 5\n"
-                        "🎟️ VOUCHERS: 30 días — S/ 5\n"
-                        "🪙 CRÉDITOS — cantidad e importe variables; consulta el precio vigente\n\n"
-                        "Ejemplos de solicitud (precio de créditos por confirmar):\n"
-                        "Hola, quiero comprar 500 créditos por S/ 400\n"
-                        "Hola, quiero adquirir la oferta de Vouchers de 30 días por S/ 5"
-                    )
+                    # Cada consulta explícita de precio envía QR + importe nuevamente,
+                    # aunque el usuario reenvíe el mismo texto varios minutos después.
+                    if quiere_precio(texto):
+                        producto = "vouchers" if re.search(r"\bvouchers?\b", texto) else "banca"
+                        await self.mandar_pago(event, uid, producto=producto)
+                    else:
+                        await self.enviar_automatico(
+                            event,
+                            "🤖 LOS CHUCKYS — PRECIOS\n\n"
+                            "📦 BOT DE BANCA: 30 días — S/ 5\n"
+                            "🎟️ VOUCHERS: 30 días — S/ 5\n"
+                            "🪙 CRÉDITOS — importe a confirmar con asesor\n\n"
+                            "Para recibir QR + precio, escribe: precio del bot o precio vouchers."
+                        )
                     return
 
                 if quiere_comprar(texto):
-                    await self.mandar_pago(event, uid)
+                    producto = "vouchers" if re.search(r"\bvouchers?\b", texto) else "banca"
+                    await self.mandar_pago(event, uid, producto=producto)
                     return
 
                 if estado.get("estado") == "revision":
                     await self.respuesta_corta(event, "✅ Tu comprobante sigue en revisión por un asesor.")
                     return
                 if estado.get("estado") == "pendiente":
+                    # No repetir QR ni molestar con cada saludo o mensaje casual.
                     return
-
-                await self.mandar_pago(event, uid, registrar_pedido=False)
+                if estado.get("estado") in ("entregado", "pagado"):
+                    return
+                await self.respuesta_corta(
+                    event, "👋 ¡Hola! Soy el asistente de Los Chuckys. "
+                           "Escribe /bot para ver los planes o «precio del bot» para recibir el QR."
+                )
             except FloodWaitError as exc:
                 logger.warning("Telegram pidió esperar %s segundos", exc.seconds)
                 await asyncio.sleep(min(int(exc.seconds), 3600))
