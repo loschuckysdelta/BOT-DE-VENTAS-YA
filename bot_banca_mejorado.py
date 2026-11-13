@@ -89,6 +89,9 @@ CONFIG_POR_DEFECTO = {
     "qr_url": "https://i.postimg.cc/sfccGwZ0/image.png",
     "numero_cuenta": "09400141002543052450",
     "api_activar_url": "https://activaciones.vercel.app/api/add_days",
+    # VACÍO hasta confirmar con el proveedor una ruta para retirar 30 días.
+    # Debe aceptar POST {"telegramId": "...", "amount": 30} y devolver éxito verificable.
+    "api_desactivar_url": "",
     # Bot de registro del cliente para usuarios que no existen en la API.
     # Se acepta @Usuario o https://t.me/Usuario.
     "bot_registro_username": "@YapeXCenter_bot",
@@ -282,6 +285,25 @@ def parece_orden_activar(texto):
                          normalizar(texto)))
 
 
+# Acciones administrativas del propietario, ESCRITAS EN EL PRIVADO DEL CLIENTE.
+# "actívate" y "desactívate" se normalizan a "activate" y "desactivate".
+ORDEN_DESACTIVAR = re.compile(
+    r"^(?:/(?:desactivar|desactivate|quitar|revocar)|desactivar|desactiva|"
+    r"desactivate|desactivale|quitar|revocar)"
+    r"(?:\s+(?:licencia|la licencia|30|30 dias|30 dias de licencia))?[.!]?$"
+)
+
+
+def es_orden_desactivar(texto):
+    return bool(ORDEN_DESACTIVAR.fullmatch(normalizar(texto)))
+
+
+def parece_orden_desactivar(texto):
+    return bool(re.match(r"^(?:/(?:desactivar|desactivate|quitar|revocar)\b|"
+                         r"(?:desactivar|desactiva|desactivate|desactivale|quitar|revocar)\b)",
+                         normalizar(texto)))
+
+
 def es_imagen(event):
     mensaje = event.message
     if getattr(mensaje, "photo", None):
@@ -414,6 +436,63 @@ def agregar_dias_api(config, uid):
     raise ApiIncierta("La API respondió sin success:true, ok:true o status de éxito")
 
 
+def quitar_dias_api(config, uid):
+    """Revoca 30 días solo mediante un endpoint de RETIRO configurado y explícito.
+
+    Nunca se usa /api/add_days con valores negativos o supuestos peligrosos.
+    El endpoint de retiro debe admitir POST {telegramId, amount:30}.
+    """
+    from urllib.parse import urlparse
+    destino = str(config.get("api_desactivar_url") or "").strip()
+    if (not destino or not destino.lower().startswith("https://")
+            or destino.rstrip("/") == str(config.get("api_activar_url", "")).rstrip("/")):
+        raise ApiRechazo("No hay un endpoint HTTPS de revocación configurado y distinto al de activación")
+    if not urlparse(destino).netloc:
+        raise ApiRechazo("La URL de revocación es inválida")
+    payload = json.dumps({"telegramId": str(uid), "amount": DIAS}).encode("utf-8")
+    cabeceras = {"Content-Type": "application/json", "Accept": "application/json"}
+    if config.get("token_activacion"):
+        cabeceras["Authorization"] = "Bearer " + str(config["token_activacion"])
+    req = urllib.request.Request(destino, data=payload, headers=cabeceras, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=float(config["timeout_api_segundos"])) as res:
+            tipo = res.headers.get("Content-Type", "").lower()
+            cuerpo = res.read(32768).decode("utf-8", errors="replace").strip()
+    except urllib.error.HTTPError as exc:
+        cuerpo = exc.read(4096).decode("utf-8", errors="replace").strip()
+        try:
+            respuesta = json.loads(cuerpo)
+        except ValueError:
+            respuesta = cuerpo
+        if es_cliente_no_registrado(respuesta):
+            raise ApiNoRegistrado("Usuario no registrado") from exc
+        if 400 <= exc.code < 500:
+            raise ApiRechazo(f"HTTP {exc.code}: {cuerpo[:250]}") from exc
+        raise ApiIncierta(f"HTTP {exc.code}: {cuerpo[:250]}") from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise ApiIncierta(str(exc)) from exc
+    if "text/html" in tipo or cuerpo.lower().startswith("<!doctype html") or not cuerpo:
+        raise ApiIncierta("La API de revocación no devolvió una confirmación válida")
+    try:
+        respuesta = json.loads(cuerpo)
+    except ValueError:
+        if cuerpo.lower() in ("ok", "success", "true"):
+            return True
+        raise ApiIncierta("Respuesta de revocación no reconocida")
+    if respuesta is True:
+        return True
+    if not isinstance(respuesta, dict):
+        raise ApiIncierta("Respuesta de revocación inválida")
+    if es_cliente_no_registrado(respuesta):
+        raise ApiNoRegistrado("Usuario no registrado")
+    if respuesta.get("success") is False or respuesta.get("ok") is False or respuesta.get("error"):
+        raise ApiRechazo(str(respuesta.get("error") or respuesta.get("message") or "La API rechazó la revocación")[:350])
+    estado = str(respuesta.get("status", "")).lower()
+    if respuesta.get("success") is True or respuesta.get("ok") is True or estado in ("ok", "success", "completed", "deactivated", "revoked"):
+        return True
+    raise ApiIncierta("El servidor no confirmó la desactivación")
+
+
 class BotBanca:
     def __init__(self, config):
         self.config = config
@@ -486,6 +565,10 @@ class BotBanca:
             "rechazada": "❌ LICENCIA NO ACTIVADA — API RECHAZÓ",
             "incierta": "⚠️ ACTIVACIÓN SIN CONFIRMAR",
             "simulacion": "🧪 SIMULACIÓN — NO MODIFICA LA API",
+            "desactivada": "🚫 LICENCIA DESACTIVADA — API CONFIRMÓ",
+            "desactivacion_rechazada": "❌ DESACTIVACIÓN RECHAZADA POR API",
+            "desactivacion_incierta": "⚠️ DESACTIVACIÓN SIN CONFIRMAR",
+            "desactivacion_sin_api": "⚠️ DESACTIVACIÓN NO EJECUTADA — FALTA API",
         }.get(estado, estado.upper())
         aviso = (f"{etiqueta}\n"
                  f"🆔 Telegram: {uid}\n"
@@ -873,15 +956,12 @@ class BotBanca:
         if event.chat_id != self.grupo_ventas_id or event.sender_id != self.mi_id:
             return
         texto = (event.raw_text or "").strip()
-        if texto.lower() in ("/prueba", "/pruebagrupo"):
-            # Prueba inofensiva del canal de auditoría; NO toca la API ni clientes.
-            self.registrar_resultado_activacion(
-                self.mi_id, "simulacion",
-                detalle="EJEMPLO: activar +30 días -> ACTIVA; retirar 30 -> INACTIVA. "
-                        "Solo simulación; no se cambió la base de datos de licencias.")
+        if texto.lower() in ("/prueba", "/pruebagrupo", "/activate", "/desactivar", "activate", "desactivate"):
+            # El grupo es únicamente el DESTINO de los registros; no modifica licencias.
             await event.reply(
-                "🧪 Prueba registrada en Activaciones e Historial. "
-                "No se activó ni se quitó ningún día a usuarios reales.")
+                "ℹ️ Para activar o desactivar, abre el PRIVADO DEL CLIENTE, "
+                "responde a uno de sus mensajes y escribe «actívate» o «desactívate». "
+                "Para simular sin cambiar la API, escribe /prueba EN ESE PRIVADO.")
             return
         match = re.fullmatch(r"/(pagado|revision|entregado|vendido|cancelar|estado)\s+(V-\d{6,})", texto, re.I)
         if match:
@@ -930,10 +1010,11 @@ class BotBanca:
                               "/entregado V-000001 — voucher o créditos enviados\n"
                               "/vendido V-000001 — igual que /entregado\n"
                               "/cancelar V-000001 — cancelar\n\n"
-                              "En el privado del cliente: actívate, /prueba, /desactivar.\n"
-                              "/prueba solo SIMULA en el grupo, no modifica licencias.\n"
-                              "/desactivar no quita días hasta integrar una API de revocación.\n"
-                              "/prueba en el grupo: verifica las notificaciones SIN tocar la API.")
+                              "Para licencias, responde en el PRIVADO DEL CLIENTE:\n"
+                              "actívate — agrega 30 días con /api/add_days.\n"
+                              "desactívate — retira 30 días SOLO si configuraste una API de revocación.\n"
+                              "/prueba — simulación en ese chat, sin tocar la API.\n"
+                              "El grupo solo recibe los registros.")
 
     def recordar_envio(self, uid, mensajes):
         if not isinstance(mensajes, (tuple, list)):
@@ -987,7 +1068,7 @@ class BotBanca:
             return
         # Dar prioridad a una orden humana de activación aunque coincida con
         # el envío de un mensaje del bot al mismo cliente.
-        if self.enviando.get(uid, 0) and not parece_orden_activar(texto):
+        if self.enviando.get(uid, 0) and not (parece_orden_activar(texto) or parece_orden_desactivar(texto)):
             return
 
         if texto in ("/on", "/off", "/estado", "/status", "/ayuda", "/help"):
@@ -1011,7 +1092,7 @@ class BotBanca:
                 )
             else:
                 await self.avisar(
-                    "Comandos para ese chat: /on, /off, /activate, /estado.\n"
+                    "En el privado del cliente: actívate, desactívate, /prueba, /on, /off, /estado.\n"
                     "Solo si la API quedó incierta, revisa el panel y luego usa /desbloquear."
                 )
             return
@@ -1030,36 +1111,38 @@ class BotBanca:
             return
 
         if texto in ("/prueba", "/prueba licencia", "/testlicencia"):
+            respuesta_id = await self.validar_respuesta_cliente(event, uid)
+            if respuesta_id is False:
+                return
             await self.eliminar_comando(event)
-            detalle = ("Prueba de flujo: ejemplo +30 días => ACTIVA; "
-                       "ejemplo -30 días => DESACTIVADA. "
-                       "No se llamó a la API, no se alteró ningún saldo ni se avisó al cliente.")
+            detalle = ("SIMULACIÓN en chat privado: ejemplo de activar +30 días => ACTIVA; "
+                       "ejemplo de retirar 30 días => DESACTIVADA. "
+                       "NO se llamó a API ni se alteró la cuenta real del cliente.")
             self.registrar_resultado_activacion(uid, "simulacion", detalle=detalle)
+            await self.enviar_automatico(
+                event, "🧪 PRUEBA DE LICENCIA — SIMULACIÓN\n\n"
+                       "✅ Ejemplo de activación: +30 días.\n"
+                       "🚫 Ejemplo de desactivación: −30 días.\n\n"
+                       "⚠️ Esto es una prueba. La licencia real NO cambió.",
+                forzar=True, responder_a=respuesta_id)
             return
 
-        if texto in ("/desactivar", "/quitar", "/quitar 30"):
+        if es_orden_desactivar(texto):
+            respuesta_id = await self.validar_respuesta_cliente(event, uid)
+            if respuesta_id is False:
+                return
             await self.eliminar_comando(event)
-            await self.avisar(
-                f"⚠️ DESACTIVACIÓN NO EJECUTADA para ID {uid}: la API configurada "
-                "solo tiene /api/add_days. Falta un endpoint confirmado para "
-                "quitar/revocar días; no se modificó la licencia.", tema="activaciones"
-            )
+            await self.desactivar_cliente(event, uid, responder_a=respuesta_id)
+            return
+        if parece_orden_desactivar(texto):
+            await self.eliminar_comando(event)
+            await self.avisar(f"⚠️ Orden no reconocida para ID {uid}: usa desactívate o /desactivar.")
             return
 
         if es_orden_activar(texto):
-            # En respuesta, valida que el mensaje citado pertenezca al cliente;
-            # nunca activamos al autor equivocado o al responder al propio bot.
-            respuesta_id = getattr(event.message, "reply_to_msg_id", None)
-            if respuesta_id is not None:
-                try:
-                    citado = await event.get_reply_message()
-                except Exception:
-                    logger.exception("No se pudo verificar la respuesta citada en %s", uid)
-                    await self.avisar(f"⚠️ No se activó a {uid}: no pude verificar el mensaje respondido.", tema="activaciones")
-                    return
-                if citado is None or int(getattr(citado, "sender_id", 0) or 0) != int(uid):
-                    await self.avisar(f"⚠️ No se activó a {uid}: responde al mensaje ORIGINAL del cliente.", tema="activaciones")
-                    return
+            respuesta_id = await self.validar_respuesta_cliente(event, uid)
+            if respuesta_id is False:
+                return
             await self.eliminar_comando(event)
             await self.activar_cliente(event, uid, responder_a=respuesta_id)
             return
@@ -1098,6 +1181,106 @@ class BotBanca:
         # Solo /off y la activación confirmada lo dejan inactivo.
         if self.estado_cliente(uid).get("recordatorio_pendiente"):
             self.guardar_estado_cliente(uid, recordatorio_pendiente=False)
+
+    async def validar_respuesta_cliente(self, event, uid):
+        """Comprueba la cita en el privado; si no hay respuesta, el chat es el destino.
+
+        El grupo NUNCA se utiliza para elegir un usuario a partir de una cita.
+        """
+        respuesta_id = getattr(event.message, "reply_to_msg_id", None)
+        if respuesta_id is None:
+            return None
+        try:
+            citado = await event.get_reply_message()
+            if citado is None and self.client is not None:
+                citado = await self.client.get_messages(int(uid), ids=int(respuesta_id))
+        except Exception:
+            logger.exception("No se pudo verificar la respuesta citada en %s", uid)
+            await self.avisar(f"⚠️ Acción rechazada: no se pudo verificar la cita para ID {uid}.", tema="activaciones")
+            return False
+        if citado is None or int(getattr(citado, "sender_id", 0) or 0) != int(uid):
+            await self.avisar(f"⚠️ Acción rechazada para ID {uid}: responde a un mensaje ORIGINAL del cliente.", tema="activaciones")
+            return False
+        return int(respuesta_id)
+
+    async def desactivar_cliente(self, event, uid, *, responder_a=None):
+        """Responde en el PRIVADO del cliente; registra resultados en el grupo."""
+        lock = self.locks_activacion.setdefault(uid, asyncio.Lock())
+        async with lock:
+            config_url = str(self.config.get("api_desactivar_url") or "").strip()
+            if not config_url:
+                self.registrar_resultado_activacion(
+                    uid, "desactivacion_sin_api", detalle="Falta configurar api_desactivar_url; no se retiraron días")
+                await self.enviar_automatico(
+                    event,
+                    "⚠️ LICENCIA NO DESACTIVADA\n\n"
+                    "Todavía no se ha podido retirar los días de tu licencia. "
+                    "Un asesor revisará la solicitud.",
+                    forzar=True, responder_a=responder_a)
+                return
+            info = self.datos_chat(uid)
+            op = info.get("operacion", {})
+            if op.get("estado") in ("en_curso", "incierta"):
+                await self.avisar(f"⚠️ ID {uid}: operación anterior pendiente; revisar antes de desactivar otra vez.")
+                return
+            marca = info.get("ultima_desactivacion", {})
+            try:
+                ultimo = float(marca.get("timestamp", 0))
+            except (ValueError, TypeError, AttributeError):
+                ultimo = 0
+            if time.time() - ultimo < COOLDOWN_ACTIVACION:
+                await self.avisar(f"⚠️ ID {uid}: desactivación reciente, no se repite la operación.")
+                return
+            try:
+                self.actualizar_chat(uid, operacion={"estado":"en_curso", "tipo":"desactivacion", "fecha":ahora_iso()})
+            except OSError as exc:
+                logger.exception("No se pudo guardar inicio de desactivación para %s", uid)
+                await self.avisar(f"❌ ID {uid}: no se inició la desactivación por error de guardado: {exc}")
+                return
+            try:
+                await asyncio.to_thread(quitar_dias_api, self.config, uid)
+            except ApiNoRegistrado:
+                self.actualizar_chat(uid, operacion={"estado":"no_registrado", "tipo":"desactivacion", "fecha":ahora_iso()})
+                self.registrar_resultado_activacion(uid, "no_registrado", detalle="Desactivación: cuenta sin registro")
+                await self.enviar_automatico(
+                    event, "⚠️ LICENCIA NO DESACTIVADA\n\n"
+                           "Tu ID de Telegram no aparece en el sistema. "
+                           "Comunícate con un asesor para revisar tu cuenta.",
+                    forzar=True, responder_a=responder_a)
+                return
+            except ApiRechazo as exc:
+                self.actualizar_chat(uid, operacion={"estado":"rechazada", "tipo":"desactivacion", "fecha":ahora_iso()})
+                self.registrar_resultado_activacion(uid, "desactivacion_rechazada", detalle=str(exc))
+                await self.enviar_automatico(event,
+                    "❌ LICENCIA NO DESACTIVADA\n\nLa solicitud fue rechazada. Un asesor revisará la cuenta.",
+                    forzar=True, responder_a=responder_a)
+                return
+            except Exception as exc:
+                self.actualizar_chat(uid, operacion={"estado":"incierta", "tipo":"desactivacion", "fecha":ahora_iso()})
+                self.registrar_resultado_activacion(uid, "desactivacion_incierta", detalle=str(exc))
+                await self.enviar_automatico(event,
+                    "⚠️ DESACTIVACIÓN SIN CONFIRMAR\n\n"
+                    "No se pudo verificar si se quitaron días. El asesor revisará el estado antes de repetir.",
+                    forzar=True, responder_a=responder_a)
+                return
+            try:
+                self.actualizar_chat(
+                    uid, activo=True, motivo="licencia_desactivada",
+                    operacion={"estado":"confirmada", "tipo":"desactivacion", "fecha":ahora_iso()},
+                    ultima_desactivacion={"dias":DIAS,"fecha":ahora_iso(),"timestamp":time.time()})
+            except OSError:
+                logger.exception("Revocación exitosa pero error de guardado para %s; NO repetir",uid)
+                await self.avisar(f"🚨 API REVOCÓ 30 días al cliente {uid} pero falló persistencia. NO repetir.")
+            try:
+                self.registrar_resultado_activacion(uid, "desactivada", dias=-DIAS,
+                                                     detalle="API de revocación confirmó retiro de 30 días")
+            except Exception:
+                logger.exception("La desactivación se confirmó pero no pudo registrarse el historial")
+            await self.enviar_automatico(event,
+                "🚫 <b>LICENCIA DESACTIVADA</b>\n\n"
+                f"📅 Días retirados: <b>{DIAS}</b>\n"
+                "✅ La API confirmó la operación.",
+                forzar=True, html=True, responder_a=responder_a)
 
     async def activar_cliente(self, event, uid, *, responder_a=None):
         lock = self.locks_activacion.setdefault(uid, asyncio.Lock())
